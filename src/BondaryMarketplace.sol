@@ -16,43 +16,36 @@ import {BondVault} from "./BondVault.sol";
  * @title BondaryMarketplace
  * @notice Marché secondaire peer-to-peer pour les parts de vaults Bondary.
  *
- *         Pourquoi un order book et non un AMM standard (Uniswap) ?
- *         Les parts de vault sont des security tokens : seules les adresses KYC
- *         peuvent les détenir. Un AMM public permettrait à n'importe qui d'acheter,
- *         ce qui violerait la réglementation MiFID II. Ici, chaque trade vérifie
- *         que l'acheteur est bien dans le whitelist Bondary.
- *
- *         Frais :
- *           - tradingFeeBps : prélevé sur chaque trade (revenu plateforme)
- *           - earlyExitPenaltyBps : prélevé en plus si le vault est encore ACTIVE
- *             (incite les investisseurs à rester jusqu'à maturité)
- *
- *         Prix :
- *           pricePerShare est exprimé en wei de l'asset par wei de part.
- *           totalCost = shares * pricePerShare / 10^shareDecimals
+ * Correction audit v2 :
+ *   recoverEscrowedShares() : si le KYC d'un vendeur est révoqué après qu'il a
+ *   créé un ordre de vente, ses parts sont séquestrées dans ce contrat et ne
+ *   peuvent plus lui être retournées (BondVault._update rejects non-KYC recipients).
+ *   Cette fonction permet à l'ADMIN de rediriger les parts vers une adresse KYC
+ *   valide fournie par le vendeur (ou désignée légalement), débloquant ainsi
+ *   les fonds sans compromettre la réglementation.
  */
 contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
-    uint256 public constant MAX_FEE_BPS     = 1_000; // 10 % plafond
+    uint256 public constant MAX_FEE_BPS     = 1_000;
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
     BondaryWhitelist    public immutable whitelist;
     BondaryFeeCollector public immutable feeCollector;
     BondVaultFactory    public immutable factory;
 
-    uint256 public tradingFeeBps;        // ex: 50 = 0.50 %
-    uint256 public earlyExitPenaltyBps;  // ex: 200 = 2.00 %
+    uint256 public tradingFeeBps;
+    uint256 public earlyExitPenaltyBps;
 
     uint256 private _nextOrderId;
 
     struct Order {
-        address vault;          // Adresse du proxy BondVault
-        address seller;         // Vendeur des parts
-        uint256 shares;         // Quantité de parts à vendre (wei)
-        uint256 pricePerShare;  // Prix par wei de part, exprimé en wei d'asset
+        address vault;
+        address seller;
+        uint256 shares;
+        uint256 pricePerShare;
         bool    active;
     }
 
@@ -78,6 +71,12 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
         uint256 penaltyFee
     );
     event OrderCancelled(uint256 indexed orderId);
+    event EscrowedSharesRecovered(
+        uint256 indexed orderId,
+        address indexed revokedSeller,
+        address indexed newRecipient,
+        uint256 shares
+    );
     event FeesUpdated(uint256 tradingFeeBps, uint256 earlyExitPenaltyBps);
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -92,7 +91,7 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
         uint256 _tradingFeeBps,
         uint256 _earlyExitPenaltyBps
     ) {
-        require(_tradingFeeBps     <= MAX_FEE_BPS, "Marketplace: trading fee too high");
+        require(_tradingFeeBps       <= MAX_FEE_BPS, "Marketplace: trading fee too high");
         require(_earlyExitPenaltyBps <= MAX_FEE_BPS, "Marketplace: penalty too high");
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
@@ -110,15 +109,6 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
     //  Order management
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * @notice Crée un ordre de vente. Les parts sont séquestrées dans ce contrat.
-     * @param vault          Adresse du BondVault dont on vend les parts
-     * @param shares         Nombre de parts à vendre (en wei)
-     * @param pricePerShare  Prix par wei de part en wei d'asset
-     *                       Ex : 1 part USDC-vault (6 dec) à 1.05 USDC
-     *                            → pricePerShare = 1_050_000
-     * @return orderId       Identifiant de l'ordre
-     */
     function createSellOrder(
         address vault,
         uint256 shares,
@@ -133,7 +123,6 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
             "Marketplace: insufficient shares"
         );
 
-        // Séquestre les parts dans ce contrat (ce contrat doit être whitelisté)
         IERC20(vault).safeTransferFrom(msg.sender, address(this), shares);
 
         orderId = _nextOrderId++;
@@ -148,11 +137,6 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
         emit OrderCreated(orderId, vault, msg.sender, shares, pricePerShare);
     }
 
-    /**
-     * @notice Exécute un ordre de vente.
-     *         Vérifie le KYC de l'acheteur, prélève les frais, transfère les parts.
-     * @param orderId  Identifiant de l'ordre à exécuter
-     */
     function fillOrder(uint256 orderId) external nonReentrant whenNotPaused {
         Order storage order = orders[orderId];
         require(order.active,                            "Marketplace: order not active");
@@ -163,14 +147,11 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
         address assetToken = BondVault(vault).asset();
         uint8   shareDec   = IERC20Metadata(vault).decimals();
 
-        // totalCost = shares * pricePerShare / 10^shareDecimals (en wei d'asset)
         uint256 totalCost = (order.shares * order.pricePerShare) / (10 ** shareDec);
         require(totalCost > 0, "Marketplace: zero cost");
 
-        // Frais de trading (toujours appliqués)
         uint256 tradingFee = (totalCost * tradingFeeBps) / BPS_DENOMINATOR;
 
-        // Pénalité de sortie anticipée si le vault est encore ACTIVE et non matured
         uint256 penaltyFee = 0;
         BondVault bv = BondVault(vault);
         if (bv.state() == BondVault.State.ACTIVE) {
@@ -183,10 +164,8 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
         uint256 totalFees      = tradingFee + penaltyFee;
         uint256 sellerReceives = totalCost - totalFees;
 
-        // Paiement : acheteur → vendeur (net de frais)
         IERC20(assetToken).safeTransferFrom(msg.sender, order.seller, sellerReceives);
 
-        // Paiement : acheteur → FeeCollector (frais)
         if (totalFees > 0) {
             IERC20(assetToken).safeTransferFrom(msg.sender, address(feeCollector), totalFees);
             if (tradingFee > 0) {
@@ -201,17 +180,12 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
             }
         }
 
-        // Transfert des parts séquestrées → acheteur
         IERC20(vault).safeTransfer(msg.sender, order.shares);
 
         order.active = false;
         emit OrderFilled(orderId, msg.sender, order.shares, totalCost, tradingFee, penaltyFee);
     }
 
-    /**
-     * @notice Annule un ordre et restitue les parts au vendeur.
-     *         Seul le vendeur ou un ADMIN peut annuler.
-     */
     function cancelOrder(uint256 orderId) external nonReentrant {
         Order storage order = orders[orderId];
         require(order.active, "Marketplace: order not active");
@@ -225,6 +199,39 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
         emit OrderCancelled(orderId);
     }
 
+    /**
+     * @notice Récupère des parts séquestrées dont le vendeur a été révoqué KYC.
+     *
+     *         Cas d'usage : le vendeur A crée un ordre, puis son KYC est révoqué
+     *         (fraude, sanction réglementaire, etc.). cancelOrder() échoue car
+     *         BondVault._update() rejette tout transfert vers une adresse non-KYC.
+     *         L'admin peut appeler cette fonction pour rediriger les parts vers
+     *         une adresse KYC-validée fournie par le vendeur ou désignée légalement.
+     *
+     * @param orderId       Ordre dont les parts sont bloquées
+     * @param newRecipient  Adresse KYC-validée qui reçoit les parts
+     */
+    function recoverEscrowedShares(uint256 orderId, address newRecipient)
+        external
+        onlyRole(ADMIN_ROLE)
+        nonReentrant
+    {
+        Order storage order = orders[orderId];
+        require(order.active,                              "Marketplace: order not active");
+        require(newRecipient != address(0),                "Marketplace: zero recipient");
+        require(!whitelist.isWhitelisted(order.seller),    "Marketplace: seller still KYC — use cancelOrder");
+        require(whitelist.isWhitelisted(newRecipient),     "Marketplace: recipient not KYC");
+
+        address vault  = order.vault;
+        uint256 shares = order.shares;
+        address seller = order.seller;
+
+        order.active = false;
+        IERC20(vault).safeTransfer(newRecipient, shares);
+
+        emit EscrowedSharesRecovered(orderId, seller, newRecipient, shares);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     //  Admin
     // ─────────────────────────────────────────────────────────────────────────
@@ -233,7 +240,7 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
         external
         onlyRole(ADMIN_ROLE)
     {
-        require(_tradingFeeBps     <= MAX_FEE_BPS, "Marketplace: trading fee too high");
+        require(_tradingFeeBps       <= MAX_FEE_BPS, "Marketplace: trading fee too high");
         require(_earlyExitPenaltyBps <= MAX_FEE_BPS, "Marketplace: penalty too high");
         tradingFeeBps       = _tradingFeeBps;
         earlyExitPenaltyBps = _earlyExitPenaltyBps;
