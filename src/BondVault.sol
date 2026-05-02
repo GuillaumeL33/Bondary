@@ -25,10 +25,16 @@ import {BondaryFeeCollector} from "./BondaryFeeCollector.sol";
  *   FAILED       → soft cap non atteint, remboursement intégral possible
  *   DEFAULTED    → défaut de l'emprunteur ; l'admin résout via resolveDefault()
  *
- * Sécurité :
- *   - Security token : les transferts sont restreints aux adresses KYC validées
- *   - UUPS upgradeable : l'implémentation peut être mise à jour par le DEFAULT_ADMIN_ROLE
- *   - ReentrancyGuard sur toutes les fonctions à transfert de fonds
+ * Sécurité (audit v2) :
+ *   - setupFeeBps plafonné à < 100 % pour prévenir tout rug-pull
+ *   - _totalDeposited traque les dépôts indépendamment du balanceOf :
+ *     les donations ERC20 directes ne peuvent plus forcer une activation prématurée
+ *   - Upgrade UUPS : délai obligatoire de 48 h entre proposeUpgrade() et
+ *     l'exécution effective dans _authorizeUpgrade()
+ *   - emergencyFailSubscription() : sortie permissionless pour les investisseurs
+ *     si l'admin est indisponible après subscriptionEnd + 7 jours
+ *   - resolveDefault(0) émet DefaultResolvedZeroRecovery pour alerter les
+ *     systèmes off-chain que les investisseurs ne récupèrent rien
  */
 contract BondVault is
     Initializable,
@@ -47,8 +53,10 @@ contract BondVault is
     bytes32 public constant ADMIN_ROLE    = keccak256("ADMIN_ROLE");
     bytes32 public constant BORROWER_ROLE = keccak256("BORROWER_ROLE");
 
-    uint256 public constant YEAR_IN_SECONDS = 365 days;
-    uint256 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public constant YEAR_IN_SECONDS         = 365 days;
+    uint256 public constant BPS_DENOMINATOR         = 10_000;
+    uint256 public constant UPGRADE_TIMELOCK        = 48 hours;
+    uint256 public constant SUBSCRIPTION_ESCAPE_DELAY = 7 days;
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Types
@@ -68,7 +76,7 @@ contract BondVault is
         uint256 setupFeeBps;            // Frais de dossier en BPS du montant levé (ex: 100 = 1 %)
         uint256 softCap;                // Montant minimum pour valider la levée (en wei asset)
         uint256 hardCap;                // Montant maximum de la levée (en wei asset)
-        uint256 minDeposit;             // Dépôt minimum par investisseur (50 € en wei)
+        uint256 minDeposit;             // Dépôt minimum par investisseur (ex: 50 € en wei)
         uint256 subscriptionEnd;        // Timestamp de fin de souscription
         uint256 loanDuration;           // Durée du prêt en secondes
         uint256 gracePeriod;            // Délai de grâce après maturité avant défaut
@@ -91,14 +99,22 @@ contract BondVault is
     uint256 public loanDuration;
     uint256 public gracePeriod;
     address public borrower;
-    BondaryWhitelist  public whitelistContract;
+    BondaryWhitelist    public whitelistContract;
     BondaryFeeCollector public feeCollector;
 
     State   public state;
     uint256 public totalBorrowed;
-    uint256 public accruedInterestSnapshot; // intérêts cristallisés au dernier snapshot
+    uint256 public accruedInterestSnapshot;
     uint256 public lastInterestUpdate;
     uint256 public loanStart;
+
+    // Tracks actual investor deposits independently of balanceOf().
+    // Prevents ERC20 donations from manipulating lifecycle cap checks.
+    uint256 private _totalDeposited;
+
+    // Upgrade timelock state
+    address public pendingUpgradeImpl;
+    uint256 public pendingUpgradeTimestamp;
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Events
@@ -110,6 +126,9 @@ contract BondVault is
     event LoanRepaid(address indexed borrower, uint256 principal, uint256 grossInterest, uint256 platformFee);
     event DefaultDeclared();
     event DefaultResolved(uint256 recoveredAmount);
+    event DefaultResolvedZeroRecovery();
+    event UpgradeProposed(address indexed newImpl, uint256 executeAfter);
+    event UpgradeCancelled(address indexed cancelledImpl);
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Modifiers
@@ -147,11 +166,15 @@ contract BondVault is
         _grantRole(ADMIN_ROLE, admin);
         _grantRole(BORROWER_ROLE, params.borrower);
 
-        require(params.softCap <= params.hardCap,           "BondVault: softCap > hardCap");
-        require(params.subscriptionEnd > block.timestamp,   "BondVault: subscriptionEnd in past");
-        require(params.loanDuration > 0,                    "BondVault: zero duration");
-        require(params.interestRateBps > 0,                 "BondVault: zero rate");
-        require(params.platformInterestFeeBps < BPS_DENOMINATOR, "BondVault: fee >= 100%");
+        require(params.softCap <= params.hardCap,                        "BondVault: softCap > hardCap");
+        require(params.subscriptionEnd > block.timestamp,                "BondVault: subscriptionEnd in past");
+        require(params.loanDuration > 0,                                 "BondVault: zero duration");
+        require(params.interestRateBps > 0,                              "BondVault: zero rate");
+        require(params.platformInterestFeeBps < BPS_DENOMINATOR,         "BondVault: platform fee >= 100%");
+        require(params.setupFeeBps < BPS_DENOMINATOR,                    "BondVault: setup fee >= 100%");
+        require(params.minDeposit > 0,                                   "BondVault: zero minDeposit");
+        require(params.whitelistAddr != address(0),                      "BondVault: zero whitelist");
+        require(params.feeCollectorAddr != address(0),                   "BondVault: zero feeCollector");
 
         interestRateBps        = params.interestRateBps;
         platformInterestFeeBps = params.platformInterestFeeBps;
@@ -176,18 +199,11 @@ contract BondVault is
     /**
      * @notice Retourne la valeur totale des actifs du vault.
      *
-     * En phase ACTIVE, la valeur comprend :
-     *   cash restant dans le vault
-     *   + principal prêté
-     *   + intérêts courus nets (déduit la part plateforme)
-     *
-     * Le prix des parts augmente en temps réel au fil des intérêts.
+     * En phase ACTIVE :
+     *   cash restant + principal prêté + intérêts nets courus
      */
     function totalAssets() public view override returns (uint256) {
         if (state != State.ACTIVE) {
-            // SUBSCRIPTION, FAILED  → juste le cash (intérêts = 0)
-            // CLOSED                → cash après remboursement complet
-            // DEFAULTED             → cash restant dans le vault (peut être 0)
             return super.totalAssets();
         }
 
@@ -199,10 +215,6 @@ contract BondVault is
         return cashInVault + totalBorrowed + netInterest;
     }
 
-    /**
-     * @dev Les parts ont le même nombre de décimales que l'asset sous-jacent
-     *      (6 pour USDC/EURC) — 100 € déposés = 100 parts affichées.
-     */
     function decimals()
         public
         view
@@ -239,13 +251,24 @@ contract BondVault is
         return super.mint(shares, receiver);
     }
 
+    /**
+     * @dev Override _deposit to track investor deposits independently of balanceOf().
+     *      This prevents ERC20 donations from affecting hardCap / softCap logic.
+     */
+    function _deposit(address caller, address receiver, uint256 assets, uint256 shares)
+        internal
+        override
+    {
+        _totalDeposited += assets;
+        super._deposit(caller, receiver, assets, shares);
+    }
+
     function maxDeposit(address receiver) public view override returns (uint256) {
         if (state != State.SUBSCRIPTION) return 0;
         if (block.timestamp >= subscriptionEnd) return 0;
         if (!whitelistContract.isWhitelisted(receiver)) return 0;
-        uint256 current = super.totalAssets();
-        if (current >= hardCap) return 0;
-        return hardCap - current;
+        if (_totalDeposited >= hardCap) return 0;
+        return hardCap - _totalDeposited;
     }
 
     function maxMint(address receiver) public view override returns (uint256) {
@@ -293,11 +316,6 @@ contract BondVault is
     //  Security token : transferts restreints aux adresses KYC
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * @dev Surcharge ERC-20 : mint (from=0) et burn (to=0) sont libres,
-     *      mais tout transfert entre wallets exige que le destinataire soit KYC.
-     *      Le marketplace (contrat officiel whitelisté) doit être dans le whitelist.
-     */
     function _update(address from, address to, uint256 value) internal override {
         if (from != address(0) && to != address(0)) {
             require(whitelistContract.isWhitelisted(to), "BondVault: recipient not KYC");
@@ -311,26 +329,24 @@ contract BondVault is
 
     /**
      * @notice Active le prêt après la souscription.
-     *         Prélève les frais de dossier, démarre l'horloge des intérêts.
-     *         Peut être appelé dès que le hardCap est atteint ou après subscriptionEnd.
+     *         Utilise _totalDeposited (donation-resistant) pour les vérifications.
      */
     function activateLoan() external onlyRole(ADMIN_ROLE) onlyState(State.SUBSCRIPTION) {
-        uint256 raised = super.totalAssets();
         require(
-            block.timestamp >= subscriptionEnd || raised >= hardCap,
+            block.timestamp >= subscriptionEnd || _totalDeposited >= hardCap,
             "BondVault: subscription still open"
         );
-        require(raised >= softCap, "BondVault: soft cap not reached");
+        require(_totalDeposited >= softCap, "BondVault: soft cap not reached");
 
-        // Frais de dossier prélevés sur le montant levé, envoyés au FeeCollector
+        uint256 raised   = _totalDeposited;
         uint256 setupFee = (raised * setupFeeBps) / BPS_DENOMINATOR;
         if (setupFee > 0) {
             IERC20(asset()).safeTransfer(address(feeCollector), setupFee);
             feeCollector.notifyFeeReceived(asset(), setupFee, BondaryFeeCollector.FeeType.SETUP);
         }
 
-        loanStart           = block.timestamp;
-        lastInterestUpdate  = block.timestamp;
+        loanStart          = block.timestamp;
+        lastInterestUpdate = block.timestamp;
 
         _changeState(State.ACTIVE);
         emit LoanActivated(raised, setupFee);
@@ -338,31 +354,45 @@ contract BondVault is
 
     /**
      * @notice Déclare la souscription en échec (soft cap non atteint).
-     *         Les investisseurs peuvent ensuite racheter leur dépôt intégral.
      */
     function failSubscription() external onlyRole(ADMIN_ROLE) onlyState(State.SUBSCRIPTION) {
         require(block.timestamp >= subscriptionEnd, "BondVault: subscription still open");
-        require(super.totalAssets() < softCap,      "BondVault: soft cap reached");
+        require(_totalDeposited < softCap,           "BondVault: soft cap reached");
+        _changeState(State.FAILED);
+    }
+
+    /**
+     * @notice Sortie permissionless : tout appelant peut déclarer l'échec de la
+     *         souscription si l'admin n'a pas agi 7 jours après subscriptionEnd
+     *         et que le softCap n'est pas atteint.
+     *         Protège les investisseurs contre l'indisponibilité de l'admin.
+     */
+    function emergencyFailSubscription() external onlyState(State.SUBSCRIPTION) {
+        require(
+            block.timestamp >= subscriptionEnd + SUBSCRIPTION_ESCAPE_DELAY,
+            "BondVault: escape delay not elapsed"
+        );
+        require(_totalDeposited < softCap, "BondVault: soft cap reached");
         _changeState(State.FAILED);
     }
 
     /**
      * @notice Déclare un défaut après la maturité + période de grâce.
-     *         Fige les intérêts. L'admin résout ensuite via resolveDefault().
      */
     function declareDefault() external onlyRole(ADMIN_ROLE) onlyState(State.ACTIVE) {
         require(
             block.timestamp > loanStart + loanDuration + gracePeriod,
             "BondVault: grace period not elapsed"
         );
-        _snapInterest(); // fige les intérêts à la date du défaut
+        _snapInterest();
         _changeState(State.DEFAULTED);
         emit DefaultDeclared();
     }
 
     /**
-     * @notice Résout le défaut : l'admin injecte les fonds récupérés (légal off-chain)
-     *         et passe le vault en CLOSED pour permettre le rachat proportionnel.
+     * @notice Résout le défaut en injectant les fonds récupérés.
+     *         Si recoveredAmount == 0, émet DefaultResolvedZeroRecovery pour
+     *         alerter les systèmes off-chain que les investisseurs ne récupèrent rien.
      */
     function resolveDefault(uint256 recoveredAmount)
         external
@@ -371,8 +401,10 @@ contract BondVault is
     {
         if (recoveredAmount > 0) {
             IERC20(asset()).safeTransferFrom(msg.sender, address(this), recoveredAmount);
+        } else {
+            emit DefaultResolvedZeroRecovery();
         }
-        totalBorrowed          = 0;
+        totalBorrowed           = 0;
         accruedInterestSnapshot = 0;
         _changeState(State.CLOSED);
         emit DefaultResolved(recoveredAmount);
@@ -382,11 +414,6 @@ contract BondVault is
     //  Lifecycle : Borrower
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * @notice L'emprunteur tire tout ou partie des fonds levés.
-     *         Les intérêts sont cristallisés avant chaque tirage pour que
-     *         le nouveau montant emprunté parte d'une base propre.
-     */
     function drawLoan(uint256 amount)
         external
         onlyRole(BORROWER_ROLE)
@@ -405,11 +432,6 @@ contract BondVault is
         emit LoanDrawn(borrower, amount, totalBorrowed);
     }
 
-    /**
-     * @notice Remboursement in fine : l'emprunteur rembourse principal + intérêts bruts.
-     *         La part plateforme est envoyée au FeeCollector, le reste revient aux investisseurs.
-     *         Passage automatique en CLOSED.
-     */
     function repayLoan()
         external
         onlyRole(BORROWER_ROLE)
@@ -423,10 +445,8 @@ contract BondVault is
         uint256 netInterest   = grossInterest - platformFee;
         uint256 principal     = totalBorrowed;
 
-        // Transfert principal + intérêts nets → vault (revient aux investisseurs)
         IERC20(asset()).safeTransferFrom(msg.sender, address(this), principal + netInterest);
 
-        // Transfert frais plateforme → FeeCollector
         if (platformFee > 0) {
             IERC20(asset()).safeTransferFrom(msg.sender, address(feeCollector), platformFee);
             feeCollector.notifyFeeReceived(asset(), platformFee, BondaryFeeCollector.FeeType.INTEREST);
@@ -455,7 +475,7 @@ contract BondVault is
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  Views pratiques
+    //  Views
     // ─────────────────────────────────────────────────────────────────────────
 
     function loanMaturity() external view returns (uint256) {
@@ -470,26 +490,62 @@ contract BondVault is
         return loanStart > 0 && block.timestamp >= loanStart + loanDuration;
     }
 
+    function totalDeposited() external view returns (uint256) {
+        return _totalDeposited;
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
-    //  Sécurité
+    //  Sécurité / Pause
     // ─────────────────────────────────────────────────────────────────────────
 
     function pause()   external onlyRole(ADMIN_ROLE) { _pause(); }
     function unpause() external onlyRole(ADMIN_ROLE) { _unpause(); }
 
-    /// @dev Seul le DEFAULT_ADMIN_ROLE (Gnosis Safe) peut upgrader l'implémentation.
-    function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Upgrade UUPS avec timelock 48h
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * @notice Propose une nouvelle implémentation. L'upgrade ne peut être exécuté
+     *         qu'après UPGRADE_TIMELOCK (48 h), laissant le temps aux investisseurs
+     *         et aux systèmes de monitoring de détecter une mise à jour malveillante.
+     */
+    function proposeUpgrade(address newImpl) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newImpl != address(0), "BondVault: zero impl");
+        pendingUpgradeImpl      = newImpl;
+        pendingUpgradeTimestamp = block.timestamp + UPGRADE_TIMELOCK;
+        emit UpgradeProposed(newImpl, pendingUpgradeTimestamp);
+    }
+
+    /**
+     * @notice Annule une proposition d'upgrade en cours.
+     */
+    function cancelUpgrade() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        emit UpgradeCancelled(pendingUpgradeImpl);
+        pendingUpgradeImpl      = address(0);
+        pendingUpgradeTimestamp = 0;
+    }
+
+    /**
+     * @dev Seul un upgrade correctement proposé ET dont le délai est écoulé peut être exécuté.
+     */
+    function _authorizeUpgrade(address newImpl) internal override onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newImpl == pendingUpgradeImpl,            "BondVault: upgrade not proposed");
+        require(block.timestamp >= pendingUpgradeTimestamp, "BondVault: timelock not elapsed");
+        pendingUpgradeImpl      = address(0);
+        pendingUpgradeTimestamp = 0;
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Internal helpers
     // ─────────────────────────────────────────────────────────────────────────
 
     function _requireSubscriptionOpen(uint256 assets, address receiver) internal view {
-        require(state == State.SUBSCRIPTION,                      "BondVault: not in subscription");
-        require(block.timestamp < subscriptionEnd,                "BondVault: subscription ended");
-        require(whitelistContract.isWhitelisted(receiver),        "BondVault: not KYC");
-        require(assets >= minDeposit,                             "BondVault: below min deposit");
-        require(super.totalAssets() + assets <= hardCap,          "BondVault: hard cap exceeded");
+        require(state == State.SUBSCRIPTION,                             "BondVault: not in subscription");
+        require(block.timestamp < subscriptionEnd,                       "BondVault: subscription ended");
+        require(whitelistContract.isWhitelisted(receiver),               "BondVault: not KYC");
+        require(assets >= minDeposit,                                    "BondVault: below min deposit");
+        require(_totalDeposited + assets <= hardCap,                     "BondVault: hard cap exceeded");
     }
 
     function _changeState(State newState) internal {
