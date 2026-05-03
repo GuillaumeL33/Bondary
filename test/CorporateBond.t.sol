@@ -6,7 +6,20 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {CorporateBond} from "../src/CorporateBond.sol";
 import {ComplianceManager} from "../src/ComplianceManager.sol";
 import {BondaryFeeCollector} from "../src/BondaryFeeCollector.sol";
+import {IIdentity} from "../src/interfaces/IERC3643.sol";
 import {ERC20Mock} from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
+
+contract MockIdentity is IIdentity {
+    mapping(bytes32 => mapping(uint256 => bool)) private _purposes;
+
+    function setKeyPurpose(address wallet, uint256 purpose, bool allowed) external {
+        _purposes[keccak256(abi.encode(wallet))][purpose] = allowed;
+    }
+
+    function keyHasPurpose(bytes32 key, uint256 purpose) external view returns (bool) {
+        return _purposes[key][purpose];
+    }
+}
 
 /**
  * @title CorporateBondTest
@@ -351,10 +364,6 @@ contract CorporateBondTest is Test {
         vm.warp(bond.nextCouponDate());
 
         uint256 couponAmount = bond.expectedCouponAmount();
-        // Platform fee = 0.5% of couponAmount (taken from gross)
-        // issuer pays net coupon + platform fee
-        uint256 platformFee = couponAmount * COUPON_FEE_BPS / 10_000;
-        uint256 netCoupon   = couponAmount - platformFee;
 
         usdc.mint(issuer, couponAmount);
         vm.startPrank(issuer);
@@ -444,10 +453,10 @@ contract CorporateBondTest is Test {
     //  5. RETROACTIVE COUPON ON LATE ALLOCATION CLAIM
     // ─────────────────────────────────────────────────────────────────────────
 
-    function test_RetroactiveCoupon_LateClaimGetsAllCoupons() public {
+    function test_RetroactiveCoupon_LateClaimGetsProRataCoupons() public {
         // Alice subscribes, bob subscribes.
         // Only alice claims allocation → coupon paid → bob claims allocation late.
-        // Bob should receive ALL coupons retroactively.
+        // Bob should receive his pro-rata share without over-promising contract funds.
         _subscribe(bond, alice, 500);
         _subscribe(bond, bob,   500);
         _activate(bond);
@@ -472,12 +481,11 @@ contract CorporateBondTest is Test {
         vm.prank(bob);
         bond.claimAllocation();
 
-        // Bob should have retroactive credit for all coupons since activation
+        // Bob should have retroactive credit for his subscribed share since activation
         uint256 bobPending = bond.pendingCoupons(bob);
-        // totalCouponPerToken was set based on 500 bonds (alice only)
-        // So totalCouponPerToken = netCoupon * 1e18 / 500
-        // Bob gets 500 * totalCouponPerToken / 1e18 = netCoupon
-        assertEq(bobPending, netCoupon);
+        // totalCouponPerToken is based on all coupon-eligible bonds (1,000),
+        // not only the currently claimed supply.
+        assertEq(bobPending, netCoupon / 2);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -600,6 +608,32 @@ contract CorporateBondTest is Test {
         assertEq(uint8(bond.state()), uint8(CorporateBond.State.CLOSED));
     }
 
+    function test_RepayPrincipal_CoversUnclaimedAllocations() public {
+        _subscribe(bond, alice, 500);
+        _subscribe(bond, bob, 400);
+        _activate(bond);
+
+        vm.prank(alice);
+        bond.claimAllocation();
+
+        vm.warp(maturityDate + 1);
+
+        uint256 principal = 900 * FACE_VALUE;
+        usdc.mint(issuer, principal);
+        vm.startPrank(issuer);
+        usdc.approve(address(bond), principal);
+        bond.repayPrincipal();
+        vm.stopPrank();
+
+        vm.prank(bob);
+        bond.claimAllocation();
+
+        uint256 balBefore = usdc.balanceOf(bob);
+        vm.prank(bob);
+        bond.redeemBonds(400);
+        assertEq(usdc.balanceOf(bob) - balBefore, 400 * FACE_VALUE);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     //  8. PARTIAL REDEMPTION
     // ─────────────────────────────────────────────────────────────────────────
@@ -678,6 +712,28 @@ contract CorporateBondTest is Test {
         vm.prank(alice);
         vm.expectRevert("Bond: pool exhausted");
         bond.redeemEarly(11); // exceeds pool
+    }
+
+    function test_EarlyBuyback_RevertIfWalletFrozen() public {
+        _subscribe(bond, alice, 900);
+        _activate(bond);
+        vm.prank(alice);
+        bond.claimAllocation();
+
+        uint256 ratePerBond = 950e6;
+        uint256 totalFunds = 100 * ratePerBond;
+        usdc.mint(issuer, totalFunds);
+        vm.startPrank(issuer);
+        usdc.approve(address(bond), totalFunds);
+        bond.openEarlyBuyback(totalFunds, ratePerBond);
+        vm.stopPrank();
+
+        vm.prank(admin);
+        bond.setAddressFrozen(alice, true);
+
+        vm.prank(alice);
+        vm.expectRevert("Bond: wallet frozen");
+        bond.redeemEarly(10);
     }
 
     function test_EarlyBuyback_RevertIfNotEnabled() public {
@@ -773,6 +829,108 @@ contract CorporateBondTest is Test {
 
         _subscribe(bond, alice, 1);
         assertEq(bond.subscriptions(alice), 1);
+    }
+
+    // ---------------------------------------------------------------------
+    //  12. ERC-3643 STANDARD SURFACE
+    // ---------------------------------------------------------------------
+
+    function test_ERC3643_WiringAndMetadata() public view {
+        assertEq(address(bond.identityRegistry()), address(compliance));
+        assertEq(address(bond.compliance()), address(compliance));
+        assertEq(bond.version(), "1.0.0-erc3643");
+        assertEq(bond.name(), "Bondary Test Bond");
+        assertEq(bond.symbol(), "BTB");
+    }
+
+    function test_ERC3643_FreezeBlocksRegularTransfer() public {
+        _subscribe(bond, alice, 900);
+        _activate(bond);
+        vm.prank(alice);
+        bond.claimAllocation();
+
+        vm.prank(admin);
+        bond.setAddressFrozen(alice, true);
+
+        vm.prank(alice);
+        vm.expectRevert("Bond: wallet frozen");
+        bond.transfer(bob, 10);
+    }
+
+    function test_ERC3643_PartialFreezeBlocksOnlyFrozenAmount() public {
+        _subscribe(bond, alice, 900);
+        _activate(bond);
+        vm.prank(alice);
+        bond.claimAllocation();
+
+        vm.prank(admin);
+        bond.freezePartialTokens(alice, 800);
+
+        vm.prank(alice);
+        vm.expectRevert("Bond: insufficient free balance");
+        bond.transfer(bob, 200);
+
+        vm.prank(alice);
+        bond.transfer(bob, 100);
+        assertEq(bond.balanceOf(bob), 100);
+    }
+
+    function test_ERC3643_ForcedTransferByAgentBypassesFreeze() public {
+        _subscribe(bond, alice, 900);
+        _activate(bond);
+        vm.prank(alice);
+        bond.claimAllocation();
+
+        vm.startPrank(admin);
+        bond.setAddressFrozen(alice, true);
+        bond.freezePartialTokens(alice, 900);
+        bond.forcedTransfer(alice, bob, 200);
+        vm.stopPrank();
+
+        assertEq(bond.balanceOf(alice), 700);
+        assertEq(bond.balanceOf(bob), 200);
+        assertEq(bond.getFrozenTokens(alice), 700);
+    }
+
+    function test_ERC3643_BatchMintAndBurnByAgent() public {
+        address[] memory recipients = new address[](2);
+        recipients[0] = alice;
+        recipients[1] = bob;
+        uint256[] memory amounts = new uint256[](2);
+        amounts[0] = 10;
+        amounts[1] = 20;
+
+        vm.prank(admin);
+        bond.batchMint(recipients, amounts);
+        assertEq(bond.balanceOf(alice), 10);
+        assertEq(bond.balanceOf(bob), 20);
+
+        vm.prank(admin);
+        bond.batchBurn(recipients, amounts);
+        assertEq(bond.balanceOf(alice), 0);
+        assertEq(bond.balanceOf(bob), 0);
+    }
+
+    function test_ERC3643_RecoveryAddressMovesBalanceAndIdentity() public {
+        address newAliceWallet = makeAddr("newAliceWallet");
+        MockIdentity identity = new MockIdentity();
+        identity.setKeyPurpose(newAliceWallet, 1, true);
+
+        _subscribe(bond, alice, 900);
+        _activate(bond);
+        vm.prank(alice);
+        bond.claimAllocation();
+
+        vm.startPrank(admin);
+        compliance.grantRole(compliance.KYC_OPERATOR_ROLE(), address(bond));
+        bond.recoveryAddress(alice, newAliceWallet, address(identity));
+        vm.stopPrank();
+
+        assertEq(bond.balanceOf(alice), 0);
+        assertEq(bond.balanceOf(newAliceWallet), 900);
+        assertFalse(compliance.contains(alice));
+        assertTrue(compliance.contains(newAliceWallet));
+        assertEq(address(compliance.identity(newAliceWallet)), address(identity));
     }
 
     // ─────────────────────────────────────────────────────────────────────────

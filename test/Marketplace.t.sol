@@ -268,6 +268,24 @@ contract MarketplaceTest is Test {
         vm.stopPrank();
     }
 
+    function test_FillOrder_RevertIfSellerNotCompliant() public {
+        vm.startPrank(alice);
+        bond.approve(address(marketplace), 50);
+        uint256 orderId = marketplace.createSellOrder(address(bond), 50, FACE_VALUE);
+        vm.stopPrank();
+
+        vm.prank(admin);
+        compliance.revoke(alice);
+
+        uint256 cost = 50 * FACE_VALUE;
+        usdc.mint(charlie, cost);
+        vm.startPrank(charlie);
+        usdc.approve(address(marketplace), cost);
+        vm.expectRevert("Marketplace: seller not compliant");
+        marketplace.fillOrder(orderId);
+        vm.stopPrank();
+    }
+
     function test_FillOrder_RevertIfSelfTrade() public {
         vm.startPrank(alice);
         bond.approve(address(marketplace), 50);
