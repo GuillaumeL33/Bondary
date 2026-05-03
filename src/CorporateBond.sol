@@ -9,8 +9,8 @@ import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Pau
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {ComplianceManager} from "./ComplianceManager.sol";
 import {BondaryFeeCollector} from "./BondaryFeeCollector.sol";
+import {IERC3643, ICompliance, IIdentity, IIdentityRegistry} from "./interfaces/IERC3643.sol";
 
 /**
  * @title CorporateBond
@@ -48,7 +48,8 @@ contract CorporateBond is
     AccessControlUpgradeable,
     PausableUpgradeable,
     ReentrancyGuardUpgradeable,
-    UUPSUpgradeable
+    UUPSUpgradeable,
+    IERC3643
 {
     using SafeERC20 for IERC20;
 
@@ -58,10 +59,12 @@ contract CorporateBond is
 
     bytes32 public constant ADMIN_ROLE  = keccak256("ADMIN_ROLE");
     bytes32 public constant ISSUER_ROLE = keccak256("ISSUER_ROLE");
+    bytes32 public constant AGENT_ROLE  = keccak256("AGENT_ROLE");
 
     uint256 public constant BPS_DENOMINATOR  = 10_000;
     uint256 public constant YEAR_IN_SECONDS  = 365 days;
     uint256 public constant PRECISION        = 1e18;
+    string  public constant TOKEN_VERSION    = "1.0.0-erc3643";
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Types
@@ -108,6 +111,7 @@ contract CorporateBond is
 
     // Accrual des coupons (mode COUPON) — pattern "dividend per token"
     uint256 public totalCouponPerToken;                        // PRECISION-scaled, cumulatif
+    uint256 public couponEligibleSupply;                       // bonds ayant droit aux prochains coupons
     mapping(address => uint256) private _couponCheckpoint;     // dernier totalCouponPerToken vu
     mapping(address => uint256) private _pendingCoupons;       // USDC_wei en attente de claim
 
@@ -121,8 +125,21 @@ contract CorporateBond is
     // Plateforme
     uint256 public setupFeeBps;
     uint256 public platformCouponFeeBps;
-    ComplianceManager   public compliance;
     BondaryFeeCollector public feeCollector;
+
+    // ERC-3643 metadata and control plane
+    string private _tokenName;
+    string private _tokenSymbol;
+    address private _tokenOnchainID;
+    IIdentityRegistry private _identityRegistry;
+    ICompliance private _tokenCompliance;
+    mapping(address => bool) private _frozen;
+    mapping(address => uint256) private _frozenTokens;
+    bool private _forcedTransferInProgress;
+
+    uint256 public constant UPGRADE_DELAY = 48 hours;
+    address public pendingUpgradeImpl;
+    uint256 public pendingUpgradeTimestamp;
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Events
@@ -142,6 +159,8 @@ contract CorporateBond is
     event EarlyBuybackRedeemed(address indexed investor, uint256 bonds, uint256 payment);
     event MaturityReached();
     event StateChanged(State indexed oldState, State indexed newState);
+    event UpgradeProposed(address indexed implementation, uint256 executableAt);
+    event UpgradeCancelled(address indexed implementation);
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Modifiers
@@ -179,9 +198,12 @@ contract CorporateBond is
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(ADMIN_ROLE, admin);
+        _grantRole(AGENT_ROLE, admin);
         _grantRole(ISSUER_ROLE, _terms.issuer);
+        _grantRole(AGENT_ROLE, _terms.issuer);
 
         // Validations
+        require(admin != address(0),                              "Bond: zero admin");
         require(_terms.totalIssuance > 0,                        "Bond: zero issuance");
         require(_terms.softCap <= _terms.totalIssuance,          "Bond: softCap > totalIssuance");
         require(_terms.issuancePrice > 0,                        "Bond: zero price");
@@ -191,14 +213,23 @@ contract CorporateBond is
         require(_terms.maturityDate > block.timestamp,           "Bond: maturity in past");
         require(_terms.subscriptionEnd > block.timestamp,        "Bond: subscriptionEnd in past");
         require(_terms.subscriptionEnd < _terms.maturityDate,    "Bond: end after maturity");
-        require(_platformCouponFeeBps < BPS_DENOMINATOR,        "Bond: platform fee >= 100%");
+        require(_terms.paymentToken != address(0),               "Bond: zero payment token");
+        require(_terms.issuer != address(0),                     "Bond: zero issuer");
+        require(_feeCollector != address(0),                     "Bond: zero feeCollector");
+        require(_setupFeeBps < BPS_DENOMINATOR,                  "Bond: setup fee >= 100%");
+        require(_platformCouponFeeBps < BPS_DENOMINATOR,         "Bond: platform fee >= 100%");
 
+        _tokenName           = _name;
+        _tokenSymbol         = _symbol;
         terms                = _terms;
         setupFeeBps          = _setupFeeBps;
         platformCouponFeeBps = _platformCouponFeeBps;
-        compliance           = ComplianceManager(_compliance);
         feeCollector         = BondaryFeeCollector(_feeCollector);
         state                = State.SUBSCRIPTION;
+
+        _setIdentityRegistry(_compliance);
+        _setCompliance(_compliance);
+        emit UpdatedTokenInformation(_tokenName, _tokenSymbol, decimals(), TOKEN_VERSION, _tokenOnchainID);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -213,6 +244,14 @@ contract CorporateBond is
         return 0;
     }
 
+    function name() public view override returns (string memory) {
+        return _tokenName;
+    }
+
+    function symbol() public view override returns (string memory) {
+        return _tokenSymbol;
+    }
+
     /**
      * @dev Surcharge ERC-20 :
      *      - Vérifie la conformité KYC/AML pour les transferts réguliers
@@ -220,9 +259,20 @@ contract CorporateBond is
      */
     function _update(address from, address to, uint256 value) internal override {
         // Conformité : uniquement pour les transferts (pas mint ni burn)
-        if (from != address(0) && to != address(0)) {
-            require(compliance.isVerified(from), "Bond: sender not compliant");
-            require(compliance.isVerified(to),   "Bond: recipient not compliant");
+        if (!_forcedTransferInProgress) {
+            if (from != address(0) && to != address(0)) {
+                require(!paused(), "Pausable: paused");
+                require(!_frozen[from] && !_frozen[to], "Bond: wallet frozen");
+                require(value <= balanceOf(from) - _frozenTokens[from], "Bond: insufficient free balance");
+                require(_identityRegistry.isVerified(from), "Bond: sender not compliant");
+                require(_identityRegistry.isVerified(to), "Bond: recipient not compliant");
+                require(_tokenCompliance.canTransfer(from, to, value), "Bond: compliance failure");
+            } else if (from == address(0) && to != address(0)) {
+                require(_identityRegistry.isVerified(to), "Bond: recipient not compliant");
+                require(_tokenCompliance.canTransfer(address(0), to, value), "Bond: compliance failure");
+            }
+        } else if (to != address(0)) {
+            require(_identityRegistry.isVerified(to), "Bond: recipient not compliant");
         }
 
         // Accrual coupons avant changement de balance
@@ -232,6 +282,14 @@ contract CorporateBond is
         }
 
         super._update(from, to, value);
+
+        if (from == address(0) && to != address(0)) {
+            _tokenCompliance.created(to, value);
+        } else if (from != address(0) && to == address(0)) {
+            _tokenCompliance.destroyed(from, value);
+        } else if (from != address(0) && to != address(0)) {
+            _tokenCompliance.transferred(from, to, value);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -250,7 +308,7 @@ contract CorporateBond is
         onlyState(State.SUBSCRIPTION)
     {
         require(block.timestamp < terms.subscriptionEnd, "Bond: subscription ended");
-        require(compliance.isVerified(msg.sender),       "Bond: not compliant");
+        require(_identityRegistry.isVerified(msg.sender), "Bond: not compliant");
         require(bondAmount > 0,                          "Bond: zero amount");
 
         // Respecter le hard cap
@@ -326,8 +384,9 @@ contract CorporateBond is
         // Produit net → émetteur
         IERC20(terms.paymentToken).safeTransfer(terms.issuer, proceeds);
 
-        issueDate      = block.timestamp;
-        nextCouponDate = block.timestamp + terms.couponFrequency;
+        issueDate            = block.timestamp;
+        nextCouponDate       = block.timestamp + terms.couponFrequency;
+        couponEligibleSupply = totalSubscribed;
 
         _changeState(State.ACTIVE);
         emit BondActivated(totalSubscribed, raised, setupFee);
@@ -354,7 +413,8 @@ contract CorporateBond is
      *         Les investisseurs appellent cette fonction une fois la levée validée.
      *         Les coupons déjà versés avant cet appel sont crédités rétroactivement.
      */
-    function claimAllocation() external nonReentrant onlyState(State.ACTIVE) {
+    function claimAllocation() external nonReentrant {
+        require(state == State.ACTIVE || state == State.MATURED, "Bond: invalid state");
         uint256 bonds = subscriptions[msg.sender];
         require(bonds > 0,                         "Bond: no allocation");
         require(!allocationClaimed[msg.sender],    "Bond: already claimed");
@@ -411,7 +471,7 @@ contract CorporateBond is
             "Bond: not authorized"
         );
         require(block.timestamp >= nextCouponDate, "Bond: coupon not due");
-        require(totalSupply() > 0,                 "Bond: no bonds in circulation");
+        require(couponEligibleSupply > 0,          "Bond: no bonds in circulation");
 
         uint256 couponAmount = expectedCouponAmount();
         require(couponAmount > 0, "Bond: zero coupon");
@@ -429,7 +489,7 @@ contract CorporateBond is
         }
 
         // Mise à jour du compteur global (pattern dividend-per-token)
-        totalCouponPerToken += (netCoupon * PRECISION) / totalSupply();
+        totalCouponPerToken += (netCoupon * PRECISION) / couponEligibleSupply;
 
         couponsPaid++;
         nextCouponDate += terms.couponFrequency;
@@ -442,6 +502,8 @@ contract CorporateBond is
      */
     function claimCoupons() external nonReentrant {
         require(terms.paymentMode == PaymentMode.COUPON, "Bond: not coupon mode");
+        require(_identityRegistry.isVerified(msg.sender), "Bond: holder not compliant");
+        require(!_frozen[msg.sender], "Bond: wallet frozen");
         _accrueCoupon(msg.sender);
 
         uint256 amount = _pendingCoupons[msg.sender];
@@ -477,9 +539,9 @@ contract CorporateBond is
         require(terms.paymentMode == PaymentMode.BULLET, "Bond: not bullet mode");
         require(state == State.ACTIVE || state == State.MATURED, "Bond: invalid state");
         require(block.timestamp >= terms.maturityDate, "Bond: not matured");
-        require(totalSupply() > 0, "Bond: no bonds");
+        require(couponEligibleSupply > 0, "Bond: no bonds");
 
-        uint256 principal    = totalSupply() * terms.faceValue;
+        uint256 principal    = couponEligibleSupply * terms.faceValue;
         uint256 totalInterest = (principal * terms.couponRate *
             (terms.maturityDate - issueDate)) / (BPS_DENOMINATOR * YEAR_IN_SECONDS);
 
@@ -497,7 +559,7 @@ contract CorporateBond is
         }
 
         // Taux de rachat = montant net / nombre de bonds
-        redemptionRate = (totalNet * PRECISION) / totalSupply();
+        redemptionRate = (totalNet * PRECISION) / couponEligibleSupply;
 
         if (state == State.ACTIVE) _changeState(State.MATURED);
         emit BulletRepaid(totalNet + platformFee, platformFee);
@@ -511,13 +573,13 @@ contract CorporateBond is
         require(terms.paymentMode == PaymentMode.COUPON, "Bond: not coupon mode");
         require(state == State.ACTIVE || state == State.MATURED, "Bond: invalid state");
         require(block.timestamp >= terms.maturityDate, "Bond: not matured");
-        require(totalSupply() > 0, "Bond: no bonds");
+        require(couponEligibleSupply > 0, "Bond: no bonds");
 
-        uint256 principal = totalSupply() * terms.faceValue;
+        uint256 principal = couponEligibleSupply * terms.faceValue;
 
         IERC20(terms.paymentToken).safeTransferFrom(msg.sender, address(this), principal);
 
-        redemptionRate = (principal * PRECISION) / totalSupply();
+        redemptionRate = (principal * PRECISION) / couponEligibleSupply;
 
         if (state == State.ACTIVE) _changeState(State.MATURED);
     }
@@ -545,7 +607,7 @@ contract CorporateBond is
         uint256 payout = (bondAmount * redemptionRate) / PRECISION;
 
         // Burn des bonds
-        _burn(msg.sender, bondAmount);
+        _burnBondTokens(msg.sender, bondAmount);
 
         // Versement du principal (et intérêts si BULLET)
         IERC20(terms.paymentToken).safeTransfer(msg.sender, payout);
@@ -560,7 +622,7 @@ contract CorporateBond is
         emit BondsRedeemed(msg.sender, bondAmount, payout + pendingCoupon);
 
         // Fermeture automatique si tous les bonds sont rachetés
-        if (totalSupply() == 0) {
+        if (couponEligibleSupply == 0) {
             _changeState(State.CLOSED);
         }
     }
@@ -613,7 +675,7 @@ contract CorporateBond is
         }
 
         earlyBuybackPool -= payout;
-        _burn(msg.sender, bondAmount);
+        _burnBondTokens(msg.sender, bondAmount);
         IERC20(terms.paymentToken).safeTransfer(msg.sender, payout);
 
         emit EarlyBuybackRedeemed(msg.sender, bondAmount, payout);
@@ -640,7 +702,7 @@ contract CorporateBond is
      * @notice Montant brut du prochain coupon à verser (mode COUPON).
      */
     function expectedCouponAmount() public view returns (uint256) {
-        return (totalSupply() * terms.faceValue * terms.couponRate * terms.couponFrequency)
+        return (couponEligibleSupply * terms.faceValue * terms.couponRate * terms.couponFrequency)
             / (BPS_DENOMINATOR * YEAR_IN_SECONDS);
     }
 
@@ -650,7 +712,7 @@ contract CorporateBond is
      */
     function expectedBulletRepayment() public view returns (uint256) {
         if (issueDate == 0) return 0;
-        uint256 principal = totalSupply() * terms.faceValue;
+        uint256 principal = couponEligibleSupply * terms.faceValue;
         uint256 duration  = terms.maturityDate - issueDate;
         uint256 interest  = (principal * terms.couponRate * duration)
             / (BPS_DENOMINATOR * YEAR_IN_SECONDS);
@@ -683,14 +745,306 @@ contract CorporateBond is
         return totalPaymentReceived;
     }
 
+    // ---------------------------------------------------------------------
+    // ERC-3643 token API
+    // ---------------------------------------------------------------------
+
+    function version() external pure override returns (string memory) {
+        return TOKEN_VERSION;
+    }
+
+    function onchainID() external view override returns (address) {
+        return _tokenOnchainID;
+    }
+
+    function identityRegistry() external view override returns (IIdentityRegistry) {
+        return _identityRegistry;
+    }
+
+    function compliance() external view override returns (ICompliance) {
+        return _tokenCompliance;
+    }
+
+    function isFrozen(address userAddress) external view override returns (bool) {
+        return _frozen[userAddress];
+    }
+
+    function getFrozenTokens(address userAddress) external view override returns (uint256) {
+        return _frozenTokens[userAddress];
+    }
+
+    function setName(string calldata newName) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(bytes(newName).length > 0, "Bond: empty name");
+        _tokenName = newName;
+        emit UpdatedTokenInformation(_tokenName, _tokenSymbol, decimals(), TOKEN_VERSION, _tokenOnchainID);
+    }
+
+    function setSymbol(string calldata newSymbol) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(bytes(newSymbol).length > 0, "Bond: empty symbol");
+        _tokenSymbol = newSymbol;
+        emit UpdatedTokenInformation(_tokenName, _tokenSymbol, decimals(), TOKEN_VERSION, _tokenOnchainID);
+    }
+
+    function setOnchainID(address newOnchainID) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        _tokenOnchainID = newOnchainID;
+        emit UpdatedTokenInformation(_tokenName, _tokenSymbol, decimals(), TOKEN_VERSION, _tokenOnchainID);
+    }
+
+    function setIdentityRegistry(address newIdentityRegistry) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        _setIdentityRegistry(newIdentityRegistry);
+    }
+
+    function setCompliance(address newCompliance) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        _setCompliance(newCompliance);
+    }
+
+    function setAddressFrozen(address userAddress, bool freeze) public override onlyRole(AGENT_ROLE) {
+        _frozen[userAddress] = freeze;
+        emit AddressFrozen(userAddress, freeze, msg.sender);
+    }
+
+    function freezePartialTokens(address userAddress, uint256 amount) public override onlyRole(AGENT_ROLE) {
+        _freezePartialTokens(userAddress, amount);
+    }
+
+    function unfreezePartialTokens(address userAddress, uint256 amount) public override onlyRole(AGENT_ROLE) {
+        _unfreezePartialTokens(userAddress, amount);
+    }
+
+    function forcedTransfer(address from, address to, uint256 amount)
+        public
+        override
+        onlyRole(AGENT_ROLE)
+        returns (bool)
+    {
+        _forceTransferTokens(from, to, amount);
+        return true;
+    }
+
+    function mint(address to, uint256 amount) public override onlyRole(AGENT_ROLE) {
+        _mint(to, amount);
+    }
+
+    function burn(address userAddress, uint256 amount) public override onlyRole(AGENT_ROLE) {
+        _agentBurnBondTokens(userAddress, amount);
+    }
+
+    function recoveryAddress(address lostWallet, address newWallet, address investorOnchainID)
+        external
+        override
+        onlyRole(AGENT_ROLE)
+        returns (bool)
+    {
+        require(balanceOf(lostWallet) > 0, "Bond: no tokens to recover");
+        require(newWallet != address(0) && newWallet != lostWallet, "Bond: invalid recovery wallet");
+
+        IIdentity recoveredIdentity = IIdentity(investorOnchainID);
+        bytes32 walletKey = keccak256(abi.encode(newWallet));
+        require(recoveredIdentity.keyHasPurpose(walletKey, 1), "Bond: recovery not possible");
+
+        uint16 country = _identityRegistry.investorCountry(lostWallet);
+        try _identityRegistry.registerIdentity(newWallet, recoveredIdentity, country) {}
+        catch {
+            require(_identityRegistry.isVerified(newWallet), "Bond: new wallet not compliant");
+        }
+
+        uint256 recoveredBalance = balanceOf(lostWallet);
+        uint256 frozenAmount = _frozenTokens[lostWallet];
+        bool wasFrozen = _frozen[lostWallet];
+
+        _forceTransferTokens(lostWallet, newWallet, recoveredBalance);
+
+        if (frozenAmount > 0) {
+            _freezePartialTokens(newWallet, frozenAmount);
+        }
+        if (wasFrozen) {
+            _frozen[newWallet] = true;
+            emit AddressFrozen(newWallet, true, msg.sender);
+        }
+
+        try _identityRegistry.deleteIdentity(lostWallet) {}
+        catch {}
+
+        emit RecoverySuccess(lostWallet, newWallet, investorOnchainID);
+        return true;
+    }
+
+    function batchTransfer(address[] calldata toList, uint256[] calldata amounts) external override {
+        require(toList.length == amounts.length, "Bond: length mismatch");
+        for (uint256 i = 0; i < toList.length; i++) {
+            transfer(toList[i], amounts[i]);
+        }
+    }
+
+    function batchForcedTransfer(
+        address[] calldata fromList,
+        address[] calldata toList,
+        uint256[] calldata amounts
+    ) external override {
+        require(fromList.length == toList.length && fromList.length == amounts.length, "Bond: length mismatch");
+        for (uint256 i = 0; i < fromList.length; i++) {
+            forcedTransfer(fromList[i], toList[i], amounts[i]);
+        }
+    }
+
+    function batchMint(address[] calldata toList, uint256[] calldata amounts) external override {
+        require(toList.length == amounts.length, "Bond: length mismatch");
+        for (uint256 i = 0; i < toList.length; i++) {
+            mint(toList[i], amounts[i]);
+        }
+    }
+
+    function batchBurn(address[] calldata userAddresses, uint256[] calldata amounts) external override {
+        require(userAddresses.length == amounts.length, "Bond: length mismatch");
+        for (uint256 i = 0; i < userAddresses.length; i++) {
+            burn(userAddresses[i], amounts[i]);
+        }
+    }
+
+    function batchSetAddressFrozen(address[] calldata userAddresses, bool[] calldata freeze) external override {
+        require(userAddresses.length == freeze.length, "Bond: length mismatch");
+        for (uint256 i = 0; i < userAddresses.length; i++) {
+            setAddressFrozen(userAddresses[i], freeze[i]);
+        }
+    }
+
+    function batchFreezePartialTokens(address[] calldata userAddresses, uint256[] calldata amounts)
+        external
+        override
+    {
+        require(userAddresses.length == amounts.length, "Bond: length mismatch");
+        for (uint256 i = 0; i < userAddresses.length; i++) {
+            freezePartialTokens(userAddresses[i], amounts[i]);
+        }
+    }
+
+    function batchUnfreezePartialTokens(address[] calldata userAddresses, uint256[] calldata amounts)
+        external
+        override
+    {
+        require(userAddresses.length == amounts.length, "Bond: length mismatch");
+        for (uint256 i = 0; i < userAddresses.length; i++) {
+            unfreezePartialTokens(userAddresses[i], amounts[i]);
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     //  Sécurité
     // ─────────────────────────────────────────────────────────────────────────
 
-    function pause()   external onlyRole(ADMIN_ROLE) { _pause(); }
-    function unpause() external onlyRole(ADMIN_ROLE) { _unpause(); }
+    function pause() external override onlyRole(AGENT_ROLE) {
+        _pause();
+    }
 
-    function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
+    function unpause() external override onlyRole(AGENT_ROLE) {
+        _unpause();
+    }
+
+    function proposeUpgrade(address newImplementation) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newImplementation != address(0), "Bond: zero implementation");
+        require(newImplementation.code.length > 0, "Bond: implementation not contract");
+        pendingUpgradeImpl = newImplementation;
+        pendingUpgradeTimestamp = block.timestamp + UPGRADE_DELAY;
+        emit UpgradeProposed(newImplementation, pendingUpgradeTimestamp);
+    }
+
+    function cancelUpgrade() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        address oldPending = pendingUpgradeImpl;
+        pendingUpgradeImpl = address(0);
+        pendingUpgradeTimestamp = 0;
+        emit UpgradeCancelled(oldPending);
+    }
+
+    function _setIdentityRegistry(address newIdentityRegistry) internal {
+        require(newIdentityRegistry != address(0), "Bond: zero identity registry");
+        _identityRegistry = IIdentityRegistry(newIdentityRegistry);
+        emit IdentityRegistryAdded(newIdentityRegistry);
+    }
+
+    function _setCompliance(address newCompliance) internal {
+        require(newCompliance != address(0), "Bond: zero compliance");
+        if (address(_tokenCompliance) != address(0)) {
+            try _tokenCompliance.unbindToken(address(this)) {}
+            catch {}
+        }
+        _tokenCompliance = ICompliance(newCompliance);
+        _tokenCompliance.bindToken(address(this));
+        emit ComplianceAdded(newCompliance);
+    }
+
+    function _freezePartialTokens(address userAddress, uint256 amount) internal {
+        require(userAddress != address(0), "Bond: zero user");
+        require(balanceOf(userAddress) >= _frozenTokens[userAddress] + amount, "Bond: amount exceeds balance");
+        _frozenTokens[userAddress] += amount;
+        emit TokensFrozen(userAddress, amount);
+    }
+
+    function _unfreezePartialTokens(address userAddress, uint256 amount) internal {
+        require(_frozenTokens[userAddress] >= amount, "Bond: amount exceeds frozen");
+        _frozenTokens[userAddress] -= amount;
+        emit TokensUnfrozen(userAddress, amount);
+    }
+
+    function _forceTransferTokens(address from, address to, uint256 amount) internal {
+        require(balanceOf(from) >= amount, "Bond: insufficient bonds");
+
+        uint256 freeBalance = balanceOf(from) - _frozenTokens[from];
+        if (amount > freeBalance) {
+            uint256 tokensToUnfreeze = amount - freeBalance;
+            _frozenTokens[from] -= tokensToUnfreeze;
+            emit TokensUnfrozen(from, tokensToUnfreeze);
+        }
+
+        _forcedTransferInProgress = true;
+        _transfer(from, to, amount);
+        _forcedTransferInProgress = false;
+    }
+
+    function _burnBondTokens(address userAddress, uint256 amount) internal {
+        require(balanceOf(userAddress) >= amount, "Bond: insufficient bonds");
+        require(_identityRegistry.isVerified(userAddress), "Bond: holder not compliant");
+        require(!_frozen[userAddress], "Bond: wallet frozen");
+        require(amount <= balanceOf(userAddress) - _frozenTokens[userAddress], "Bond: insufficient free balance");
+
+        _decreaseCouponEligibleSupply(amount);
+
+        _burn(userAddress, amount);
+    }
+
+    function _agentBurnBondTokens(address userAddress, uint256 amount) internal {
+        require(balanceOf(userAddress) >= amount, "Bond: insufficient bonds");
+
+        uint256 freeBalance = balanceOf(userAddress) - _frozenTokens[userAddress];
+        if (amount > freeBalance) {
+            uint256 tokensToUnfreeze = amount - freeBalance;
+            _frozenTokens[userAddress] -= tokensToUnfreeze;
+            emit TokensUnfrozen(userAddress, tokensToUnfreeze);
+        }
+
+        _decreaseCouponEligibleSupply(amount);
+
+        _burn(userAddress, amount);
+    }
+
+    function _decreaseCouponEligibleSupply(uint256 amount) internal {
+        if (couponEligibleSupply == 0) return;
+        if (amount >= couponEligibleSupply) {
+            couponEligibleSupply = 0;
+        } else {
+            couponEligibleSupply -= amount;
+        }
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(newImplementation == pendingUpgradeImpl, "Bond: upgrade not proposed");
+        require(block.timestamp >= pendingUpgradeTimestamp, "Bond: upgrade timelocked");
+        pendingUpgradeImpl = address(0);
+        pendingUpgradeTimestamp = 0;
+    }
 
     function _changeState(State newState) internal {
         emit StateChanged(state, newState);

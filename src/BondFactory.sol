@@ -41,7 +41,9 @@ contract BondFactory is AccessControl {
         address _compliance,
         address _feeCollector
     ) {
+        require(admin           != address(0), "BondFactory: zero admin");
         require(_implementation != address(0), "BondFactory: zero impl");
+        require(_implementation.code.length > 0, "BondFactory: impl not contract");
         require(_compliance     != address(0), "BondFactory: zero compliance");
         require(_feeCollector   != address(0), "BondFactory: zero feeCollector");
 
@@ -75,6 +77,8 @@ contract BondFactory is AccessControl {
         uint256 platformCouponFeeBps,
         address bondAdmin
     ) external onlyRole(BOND_CREATOR_ROLE) returns (address bondProxy) {
+        require(bondAdmin != address(0), "BondFactory: zero bondAdmin");
+        require(bondTerms.issuer != address(0), "BondFactory: zero issuer");
         bytes memory initData = abi.encodeCall(
             CorporateBond.initialize,
             (
@@ -114,6 +118,7 @@ contract BondFactory is AccessControl {
         onlyRole(DEFAULT_ADMIN_ROLE)
     {
         require(newImpl != address(0), "BondFactory: zero address");
+        require(newImpl.code.length > 0, "BondFactory: impl not contract");
         address old = implementation;
         implementation = newImpl;
         emit ImplementationUpgraded(old, newImpl);

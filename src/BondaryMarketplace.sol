@@ -97,6 +97,9 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
         uint256 _tradingFeeBps,
         uint256 _earlyExitPenaltyBps
     ) {
+        require(_compliance   != address(0), "Marketplace: zero compliance");
+        require(_feeCollector != address(0), "Marketplace: zero feeCollector");
+        require(_factory      != address(0), "Marketplace: zero factory");
         require(_tradingFeeBps       <= MAX_FEE_BPS, "Marketplace: trading fee too high");
         require(_earlyExitPenaltyBps <= MAX_FEE_BPS, "Marketplace: penalty too high");
 
@@ -163,6 +166,7 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
         Order storage order = orders[orderId];
         require(order.active,                          "Marketplace: order not active");
         require(compliance.isVerified(msg.sender),     "Marketplace: buyer not compliant");
+        require(compliance.isVerified(order.seller),   "Marketplace: seller not compliant");
         require(msg.sender != order.seller,            "Marketplace: self-trade");
 
         CorporateBond cb = CorporateBond(order.bond);

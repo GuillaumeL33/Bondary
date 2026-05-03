@@ -38,6 +38,7 @@ contract BondaryFeeCollector is AccessControl {
     event FeeWithdrawn(address indexed token, address indexed to, uint256 amount);
 
     constructor(address admin) {
+        require(admin != address(0), "FeeCollector: zero admin");
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(WITHDRAWAL_ROLE, admin);
     }
@@ -52,6 +53,8 @@ contract BondaryFeeCollector is AccessControl {
         external
         onlyRole(AUTHORIZED_SOURCE_ROLE)
     {
+        require(token != address(0), "FeeCollector: zero token");
+        require(amount > 0, "FeeCollector: zero amount");
         emit FeeReceived(msg.sender, token, amount, feeType);
     }
 
@@ -59,6 +62,9 @@ contract BondaryFeeCollector is AccessControl {
         external
         onlyRole(WITHDRAWAL_ROLE)
     {
+        require(token != address(0), "FeeCollector: zero token");
+        require(to != address(0), "FeeCollector: zero recipient");
+        require(amount > 0, "FeeCollector: zero amount");
         IERC20(token).safeTransfer(to, amount);
         emit FeeWithdrawn(token, to, amount);
     }
