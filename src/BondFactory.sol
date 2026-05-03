@@ -95,6 +95,9 @@ contract BondFactory is AccessControl {
         _officialBonds[bondProxy] = true;
         _allBonds.push(bondProxy);
 
+        // Grant AUTHORIZED_SOURCE_ROLE so the bond can call feeCollector.notifyFeeReceived()
+        feeCollector.grantRole(feeCollector.AUTHORIZED_SOURCE_ROLE(), bondProxy);
+
         emit BondCreated(bondProxy, bondTerms.issuer, name, symbol);
     }
 

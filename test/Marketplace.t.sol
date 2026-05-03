@@ -77,6 +77,11 @@ contract MarketplaceTest is Test {
         compliance.whitelist(bob);
         compliance.whitelist(charlie);
         compliance.whitelist(issuer);
+        // Grant factory DEFAULT_ADMIN_ROLE on feeCollector so it can auto-grant
+        // AUTHORIZED_SOURCE_ROLE to each bond it creates
+        feeCollector.grantRole(feeCollector.DEFAULT_ADMIN_ROLE(), address(factory));
+        // Grant marketplace AUTHORIZED_SOURCE_ROLE so it can notify fees
+        feeCollector.grantRole(feeCollector.AUTHORIZED_SOURCE_ROLE(), address(marketplace));
         vm.stopPrank();
 
         // Create bond through factory

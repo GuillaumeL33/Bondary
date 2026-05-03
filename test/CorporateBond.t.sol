@@ -95,7 +95,12 @@ contract CorporateBondTest is Test {
             )
         );
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
-        return CorporateBond(address(proxy));
+        CorporateBond b = CorporateBond(address(proxy));
+        // Grant AUTHORIZED_SOURCE_ROLE so bond can call feeCollector.notifyFeeReceived()
+        vm.startPrank(admin);
+        feeCollector.grantRole(feeCollector.AUTHORIZED_SOURCE_ROLE(), address(b));
+        vm.stopPrank();
+        return b;
     }
 
     // Subscribe bondAmount bonds for investor from their wallet
@@ -139,10 +144,12 @@ contract CorporateBondTest is Test {
         // Deploy default COUPON bond
         bond = _deployBond(CorporateBond.PaymentMode.COUPON);
 
-        // Whitelist the bond contract itself (receives payment during subscribe)
-        // Also whitelist marketplace/test contract for transfers
-        vm.prank(admin);
+        vm.startPrank(admin);
+        // Whitelist bond contract (compliance check on mint passes for address(0)→bond)
         compliance.whitelist(address(bond));
+        // Grant bond AUTHORIZED_SOURCE_ROLE so it can call feeCollector.notifyFeeReceived()
+        feeCollector.grantRole(feeCollector.AUTHORIZED_SOURCE_ROLE(), address(bond));
+        vm.stopPrank();
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -684,8 +691,10 @@ contract CorporateBondTest is Test {
              address(compliance), address(feeCollector), admin)
         );
         CorporateBond noBuyback = CorporateBond(address(new ERC1967Proxy(address(impl), initData)));
-        vm.prank(admin);
+        vm.startPrank(admin);
         compliance.whitelist(address(noBuyback));
+        feeCollector.grantRole(feeCollector.AUTHORIZED_SOURCE_ROLE(), address(noBuyback));
+        vm.stopPrank();
 
         _subscribe(noBuyback, alice, 900);
         vm.warp(subscriptionEnd + 1);

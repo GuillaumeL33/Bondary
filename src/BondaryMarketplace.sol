@@ -77,6 +77,12 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
         uint256 penaltyFee
     );
     event OrderCancelled(uint256 indexed orderId);
+    event EscrowedBondsRecovered(
+        uint256 indexed orderId,
+        address indexed revokedSeller,
+        address indexed newRecipient,
+        uint256 bondAmount
+    );
     event FeesUpdated(uint256 tradingFeeBps, uint256 earlyExitPenaltyBps);
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -223,6 +229,36 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
     // ─────────────────────────────────────────────────────────────────────────
     //  Admin
     // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * @notice Récupère des bonds bloqués dans ce contrat quand le KYC d'un vendeur
+     *         a été révoqué après la création de l'ordre.
+     *         Dans ce cas, cancelOrder() échouerait car le bond._update rejette
+     *         les transferts vers une adresse non-compliant.
+     *         L'ADMIN peut rediriger les bonds vers une adresse KYC valide désignée
+     *         légalement (par le vendeur ou par décision réglementaire).
+     * @param orderId       Ordre dont les bonds sont bloqués
+     * @param newRecipient  Adresse KYC valide qui recevra les bonds
+     */
+    function recoverEscrowedBonds(uint256 orderId, address newRecipient)
+        external
+        nonReentrant
+        onlyRole(ADMIN_ROLE)
+    {
+        Order storage order = orders[orderId];
+        require(order.active,                           "Marketplace: order not active");
+        require(!compliance.isVerified(order.seller),   "Marketplace: seller still compliant");
+        require(compliance.isVerified(newRecipient),    "Marketplace: recipient not compliant");
+
+        address bond      = order.bond;
+        uint256 amount    = order.bondAmount;
+        address seller    = order.seller;
+
+        order.active = false;
+        IERC20(bond).safeTransfer(newRecipient, amount);
+
+        emit EscrowedBondsRecovered(orderId, seller, newRecipient, amount);
+    }
 
     function updateFees(uint256 _tradingFeeBps, uint256 _earlyExitPenaltyBps)
         external

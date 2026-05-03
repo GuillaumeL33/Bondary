@@ -61,6 +61,10 @@ contract Deploy is Script {
         BondFactory factory = new BondFactory(admin, address(impl), address(cm), address(fc));
         console2.log("BondFactory        :", address(factory));
 
+        // Grant factory DEFAULT_ADMIN_ROLE on feeCollector so it can auto-grant
+        // AUTHORIZED_SOURCE_ROLE to each bond it deploys via createBond().
+        fc.grantRole(fc.DEFAULT_ADMIN_ROLE(), address(factory));
+
         // 5. BondaryMarketplace
         BondaryMarketplace marketplace = new BondaryMarketplace(
             admin,
@@ -76,6 +80,10 @@ contract Deploy is Script {
         //    (il reçoit des security tokens lors du séquestre des ordres)
         cm.whitelist(address(marketplace));
         console2.log("Marketplace whiteliste dans ComplianceManager");
+
+        // 7. Autoriser le marketplace à notifier les frais dans FeeCollector
+        fc.grantRole(fc.AUTHORIZED_SOURCE_ROLE(), address(marketplace));
+        console2.log("Marketplace autorise dans BondaryFeeCollector");
 
         vm.stopBroadcast();
 
