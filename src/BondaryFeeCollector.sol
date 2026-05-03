@@ -7,11 +7,12 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 
 /**
  * @title BondaryFeeCollector
- * @notice Collecte les commissions de la plateforme Bondary :
- *         - Frais de dossier (setup) prélevés à l'activation du vault
- *         - Part plateforme des intérêts (prélevée au remboursement)
- *         - Frais AMM sur les trades du marché secondaire
- *         - Pénalités de sortie anticipée
+ * @notice Centralise les revenus de la plateforme Bondary :
+ *         - Frais de dossier (SETUP)     : % du montant levé à l'activation
+ *         - Frais sur coupons (COUPON)   : % de chaque coupon versé
+ *         - Frais sur remboursement (REDEMPTION) : % des intérêts bullet
+ *         - Frais AMM (MARKETPLACE)      : % de chaque trade secondaire
+ *         - Pénalités de sortie (PENALTY): sortie anticipée sur le marketplace
  *
  *         Seul le WITHDRAWAL_ROLE (Gnosis Safe) peut retirer les fonds.
  */
@@ -22,7 +23,8 @@ contract BondaryFeeCollector is AccessControl {
 
     enum FeeType {
         SETUP,
-        INTEREST,
+        COUPON,
+        REDEMPTION,
         MARKETPLACE,
         PENALTY
     }
@@ -36,14 +38,17 @@ contract BondaryFeeCollector is AccessControl {
     }
 
     /**
-     * @notice Appelé par les vaults/marketplace après transfert des tokens vers ce contrat.
-     *         Ne fait qu'émettre un événement pour la comptabilité off-chain.
+     * @notice Appelé par les bonds/marketplace après transfert des tokens vers ce contrat.
+     *         Émet un événement pour la comptabilité off-chain de Bondary.
      */
     function notifyFeeReceived(address token, uint256 amount, FeeType feeType) external {
         emit FeeReceived(msg.sender, token, amount, feeType);
     }
 
-    function withdraw(address token, address to, uint256 amount) external onlyRole(WITHDRAWAL_ROLE) {
+    function withdraw(address token, address to, uint256 amount)
+        external
+        onlyRole(WITHDRAWAL_ROLE)
+    {
         IERC20(token).safeTransfer(to, amount);
         emit FeeWithdrawn(token, to, amount);
     }
