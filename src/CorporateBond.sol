@@ -200,7 +200,8 @@ contract CorporateBond is
         _grantRole(ADMIN_ROLE, admin);
         _grantRole(AGENT_ROLE, admin);
         _grantRole(ISSUER_ROLE, _terms.issuer);
-        _grantRole(AGENT_ROLE, _terms.issuer);
+        // AGENT_ROLE intentionally NOT granted to issuer — issuer is a counterparty,
+        // not a trusted operator. Bondary admin holds AGENT_ROLE for emergency ops.
 
         // Validations
         require(admin != address(0),                              "Bond: zero admin");
@@ -465,11 +466,9 @@ contract CorporateBond is
      *                         BPS × YEAR_IN_SECONDS
      */
     function payCoupon() external nonReentrant onlyState(State.ACTIVE) {
-        require(terms.paymentMode == PaymentMode.COUPON,       "Bond: not coupon mode");
-        require(
-            hasRole(ISSUER_ROLE, msg.sender) || hasRole(ADMIN_ROLE, msg.sender),
-            "Bond: not authorized"
-        );
+        require(terms.paymentMode == PaymentMode.COUPON, "Bond: not coupon mode");
+        // Only the issuer pays coupons — pulling from admin wallet would misdirect funds.
+        require(hasRole(ISSUER_ROLE, msg.sender), "Bond: not issuer");
         require(block.timestamp >= nextCouponDate, "Bond: coupon not due");
         require(couponEligibleSupply > 0,          "Bond: no bonds in circulation");
 
@@ -540,6 +539,7 @@ contract CorporateBond is
         require(state == State.ACTIVE || state == State.MATURED, "Bond: invalid state");
         require(block.timestamp >= terms.maturityDate, "Bond: not matured");
         require(couponEligibleSupply > 0, "Bond: no bonds");
+        require(redemptionRate == 0, "Bond: already repaid");
 
         uint256 principal    = couponEligibleSupply * terms.faceValue;
         uint256 totalInterest = (principal * terms.couponRate *
@@ -574,6 +574,7 @@ contract CorporateBond is
         require(state == State.ACTIVE || state == State.MATURED, "Bond: invalid state");
         require(block.timestamp >= terms.maturityDate, "Bond: not matured");
         require(couponEligibleSupply > 0, "Bond: no bonds");
+        require(redemptionRate == 0, "Bond: already repaid");
 
         uint256 principal = couponEligibleSupply * terms.faceValue;
 
@@ -651,6 +652,13 @@ contract CorporateBond is
 
         IERC20(terms.paymentToken).safeTransferFrom(msg.sender, address(this), totalFunds);
 
+        // Prevent silent rate change while investors are waiting to redeem.
+        if (earlyBuybackPool > 0) {
+            require(
+                ratePerBond * PRECISION == earlyBuybackRate,
+                "Bond: cannot change rate while pool active"
+            );
+        }
         earlyBuybackPool += totalFunds;
         earlyBuybackRate  = ratePerBond * PRECISION;
 
@@ -822,6 +830,13 @@ contract CorporateBond is
     }
 
     function mint(address to, uint256 amount) public override onlyRole(AGENT_ROLE) {
+        require(
+            state != State.MATURED && state != State.CLOSED,
+            "Bond: cannot mint after maturity"
+        );
+        // Keep couponEligibleSupply in sync so future coupons and redemptionRate
+        // are calculated over the correct supply including agent-minted bonds.
+        couponEligibleSupply += amount;
         _mint(to, amount);
     }
 
@@ -941,6 +956,7 @@ contract CorporateBond is
     }
 
     function proposeUpgrade(address newImplementation) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(pendingUpgradeImpl == address(0), "Bond: upgrade already pending");
         require(newImplementation != address(0), "Bond: zero implementation");
         require(newImplementation.code.length > 0, "Bond: implementation not contract");
         pendingUpgradeImpl = newImplementation;

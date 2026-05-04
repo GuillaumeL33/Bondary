@@ -48,10 +48,12 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
     uint256 private _nextOrderId;
 
     struct Order {
-        address bond;          // Adresse du proxy CorporateBond
-        address seller;        // Vendeur des bonds
-        uint256 bondAmount;    // Nombre de bonds entiers à vendre
-        uint256 pricePerBond;  // Prix en wei du payment token par bond entier
+        address bond;                   // Adresse du proxy CorporateBond
+        address seller;                 // Vendeur des bonds
+        uint256 bondAmount;             // Nombre de bonds entiers à vendre
+        uint256 pricePerBond;           // Prix en wei du payment token par bond entier
+        uint256 tradingFeeBpsSnapshot;  // Frais fixés à la création (anti front-running)
+        uint256 penaltyFeeBpsSnapshot;  // Pénalité fixée à la création (anti front-running)
         bool    active;
     }
 
@@ -146,11 +148,13 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
 
         orderId = _nextOrderId++;
         orders[orderId] = Order({
-            bond:         bond,
-            seller:       msg.sender,
-            bondAmount:   bondAmount,
-            pricePerBond: pricePerBond,
-            active:       true
+            bond:                  bond,
+            seller:                msg.sender,
+            bondAmount:            bondAmount,
+            pricePerBond:          pricePerBond,
+            tradingFeeBpsSnapshot: tradingFeeBps,
+            penaltyFeeBpsSnapshot: earlyExitPenaltyBps,
+            active:                true
         });
 
         emit OrderCreated(orderId, bond, msg.sender, bondAmount, pricePerBond);
@@ -176,13 +180,14 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
         uint256 totalCost = order.bondAmount * order.pricePerBond;
         require(totalCost > 0, "Marketplace: zero cost");
 
-        // Frais de trading (toujours appliqués)
-        uint256 tradingFee = (totalCost * tradingFeeBps) / BPS_DENOMINATOR;
+        // Utilise le snapshot de frais enregistré à la création de l'ordre.
+        // Protège le vendeur contre une hausse de frais (front-running admin/MEV).
+        uint256 tradingFee = (totalCost * order.tradingFeeBpsSnapshot) / BPS_DENOMINATOR;
 
         // Pénalité de sortie anticipée si le bond est encore ACTIVE (avant maturité)
         uint256 penaltyFee = 0;
         if (cb.state() == CorporateBond.State.ACTIVE) {
-            penaltyFee = (totalCost * earlyExitPenaltyBps) / BPS_DENOMINATOR;
+            penaltyFee = (totalCost * order.penaltyFeeBpsSnapshot) / BPS_DENOMINATOR;
         }
 
         uint256 totalFees      = tradingFee + penaltyFee;
