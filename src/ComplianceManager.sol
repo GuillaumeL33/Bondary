@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.24;
 
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ICompliance, IIdentity, IIdentityRegistry} from "./interfaces/IERC3643.sol";
@@ -30,7 +30,6 @@ contract ComplianceManager is AccessControl, IIdentityRegistry, ICompliance {
     mapping(address => InvestorIdentity) private _identities;
     mapping(address => bool) private _blacklisted;
     mapping(address => bool) private _boundTokens;
-    address private _lastBoundToken;
 
     event Whitelisted(address indexed account);
     event WhitelistRevoked(address indexed account);
@@ -163,24 +162,16 @@ contract ComplianceManager is AccessControl, IIdentityRegistry, ICompliance {
             _boundTokens[token] = true;
             emit TokenBound(token);
         }
-        _lastBoundToken = token;
     }
 
     function unbindToken(address token) external onlyRole(COMPLIANCE_ADMIN_ROLE) {
         require(_boundTokens[token], "Compliance: token not bound");
         _boundTokens[token] = false;
-        if (_lastBoundToken == token) {
-            _lastBoundToken = address(0);
-        }
         emit TokenUnbound(token);
     }
 
     function isTokenBound(address token) external view returns (bool) {
         return _boundTokens[token];
-    }
-
-    function getTokenBound() external view returns (address) {
-        return _lastBoundToken;
     }
 
     function canTransfer(address from, address to, uint256) external view returns (bool) {

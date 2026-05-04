@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.24;
 
 import {ERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -63,6 +63,7 @@ contract CorporateBond is
 
     uint256 public constant BPS_DENOMINATOR  = 10_000;
     uint256 public constant YEAR_IN_SECONDS  = 365 days;
+    uint256 public constant MAX_BATCH_SIZE   = 200;    // DoS protection on batch calls
     uint256 public constant PRECISION        = 1e18;
     string  public constant TOKEN_VERSION    = "1.0.0-erc3643";
 
@@ -141,6 +142,10 @@ contract CorporateBond is
     address public pendingUpgradeImpl;
     uint256 public pendingUpgradeTimestamp;
 
+    // Reserved storage slots for future upgrades — prevents storage collisions
+    // when adding state variables in a new implementation.
+    uint256[50] private __gap;
+
     // ─────────────────────────────────────────────────────────────────────────
     //  Events
     // ─────────────────────────────────────────────────────────────────────────
@@ -154,6 +159,7 @@ contract CorporateBond is
     event CouponPaid(uint256 indexed period, uint256 totalAmount, uint256 platformFee);
     event CouponsClaimed(address indexed investor, uint256 amount);
     event BulletRepaid(uint256 totalAmount, uint256 platformFee);
+    event PrincipalRepaid(uint256 principal);
     event BondsRedeemed(address indexed investor, uint256 bonds, uint256 payment);
     event EarlyBuybackOpened(uint256 totalFunds, uint256 ratePerBond);
     event EarlyBuybackRedeemed(address indexed investor, uint256 bonds, uint256 payment);
@@ -361,6 +367,7 @@ contract CorporateBond is
      */
     function activateBond()
         external
+        nonReentrant
         onlyRole(ADMIN_ROLE)
         onlyState(State.SUBSCRIPTION)
     {
@@ -583,6 +590,7 @@ contract CorporateBond is
         redemptionRate = (principal * PRECISION) / couponEligibleSupply;
 
         if (state == State.ACTIVE) _changeState(State.MATURED);
+        emit PrincipalRepaid(principal);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -886,6 +894,7 @@ contract CorporateBond is
 
     function batchTransfer(address[] calldata toList, uint256[] calldata amounts) external override {
         require(toList.length == amounts.length, "Bond: length mismatch");
+        require(toList.length <= MAX_BATCH_SIZE,  "Bond: batch too large");
         for (uint256 i = 0; i < toList.length; i++) {
             transfer(toList[i], amounts[i]);
         }
@@ -897,6 +906,7 @@ contract CorporateBond is
         uint256[] calldata amounts
     ) external override {
         require(fromList.length == toList.length && fromList.length == amounts.length, "Bond: length mismatch");
+        require(fromList.length <= MAX_BATCH_SIZE, "Bond: batch too large");
         for (uint256 i = 0; i < fromList.length; i++) {
             forcedTransfer(fromList[i], toList[i], amounts[i]);
         }
@@ -904,6 +914,7 @@ contract CorporateBond is
 
     function batchMint(address[] calldata toList, uint256[] calldata amounts) external override {
         require(toList.length == amounts.length, "Bond: length mismatch");
+        require(toList.length <= MAX_BATCH_SIZE,  "Bond: batch too large");
         for (uint256 i = 0; i < toList.length; i++) {
             mint(toList[i], amounts[i]);
         }
@@ -911,6 +922,7 @@ contract CorporateBond is
 
     function batchBurn(address[] calldata userAddresses, uint256[] calldata amounts) external override {
         require(userAddresses.length == amounts.length, "Bond: length mismatch");
+        require(userAddresses.length <= MAX_BATCH_SIZE, "Bond: batch too large");
         for (uint256 i = 0; i < userAddresses.length; i++) {
             burn(userAddresses[i], amounts[i]);
         }
@@ -918,6 +930,7 @@ contract CorporateBond is
 
     function batchSetAddressFrozen(address[] calldata userAddresses, bool[] calldata freeze) external override {
         require(userAddresses.length == freeze.length, "Bond: length mismatch");
+        require(userAddresses.length <= MAX_BATCH_SIZE, "Bond: batch too large");
         for (uint256 i = 0; i < userAddresses.length; i++) {
             setAddressFrozen(userAddresses[i], freeze[i]);
         }
@@ -928,6 +941,7 @@ contract CorporateBond is
         override
     {
         require(userAddresses.length == amounts.length, "Bond: length mismatch");
+        require(userAddresses.length <= MAX_BATCH_SIZE, "Bond: batch too large");
         for (uint256 i = 0; i < userAddresses.length; i++) {
             freezePartialTokens(userAddresses[i], amounts[i]);
         }
@@ -938,6 +952,7 @@ contract CorporateBond is
         override
     {
         require(userAddresses.length == amounts.length, "Bond: length mismatch");
+        require(userAddresses.length <= MAX_BATCH_SIZE, "Bond: batch too large");
         for (uint256 i = 0; i < userAddresses.length; i++) {
             unfreezePartialTokens(userAddresses[i], amounts[i]);
         }
