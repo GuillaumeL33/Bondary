@@ -217,6 +217,11 @@ contract CorporateBond is
         require(_terms.faceValue > 0,                            "Bond: zero faceValue");
         require(_terms.couponRate > 0,                           "Bond: zero rate");
         require(_terms.couponRate < BPS_DENOMINATOR,             "Bond: rate >= 100%");
+        // M-04 fix: COUPON mode bonds must have a meaningful coupon frequency.
+        require(
+            _terms.paymentMode == PaymentMode.BULLET || _terms.couponFrequency >= 1 days,
+            "Bond: couponFrequency must be >= 1 day for COUPON mode"
+        );
         require(_terms.maturityDate > block.timestamp,           "Bond: maturity in past");
         require(_terms.subscriptionEnd > block.timestamp,        "Bond: subscriptionEnd in past");
         require(_terms.subscriptionEnd < _terms.maturityDate,    "Bond: end after maturity");
@@ -339,6 +344,8 @@ contract CorporateBond is
     /**
      * @notice Annuler sa souscription et récupérer le paiement.
      *         Uniquement en phase SUBSCRIPTION.
+     * @dev Intentionally not whenNotPaused — investors must always be able to
+     *      recover their funds even during an emergency pause.
      */
     function cancelSubscription() external nonReentrant onlyState(State.SUBSCRIPTION) {
         uint256 bonds   = subscriptions[msg.sender];
@@ -435,9 +442,16 @@ contract CorporateBond is
         _mint(msg.sender, bonds);
 
         // Crédit rétroactif des coupons depuis le début du bond
-        // (totalCouponPerToken à l'activation = 0 par définition du contrat)
+        // (totalCouponPerToken à l'activation = 0 par définition du contrat).
+        //
+        // C-01 fix: when state == MATURED, _update() skips _accrueCoupon() because the
+        // guard is (state == ACTIVE). The checkpoint therefore stays at 0. Without the
+        // assignment below, a subsequent call to claimCoupons() / redeemBonds() would
+        // invoke _accrueCoupon() with checkpoint=0 and recompute the same amount a second
+        // time, letting the investor drain 2× their entitled coupons from the pool.
         if (terms.paymentMode == PaymentMode.COUPON && totalCouponPerToken > 0) {
             _pendingCoupons[msg.sender] += (bonds * totalCouponPerToken) / PRECISION;
+            _couponCheckpoint[msg.sender] = totalCouponPerToken;
         }
 
         emit AllocationClaimed(msg.sender, bonds);
@@ -706,8 +720,9 @@ contract CorporateBond is
         if (totalCouponPerToken > checkpoint) {
             uint256 earned = (balanceOf(account) * (totalCouponPerToken - checkpoint)) / PRECISION;
             _pendingCoupons[account] += earned;
+            // G-01 fix: write checkpoint only when there is something to update.
+            _couponCheckpoint[account] = totalCouponPerToken;
         }
-        _couponCheckpoint[account] = totalCouponPerToken;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -838,9 +853,11 @@ contract CorporateBond is
     }
 
     function mint(address to, uint256 amount) public override onlyRole(AGENT_ROLE) {
+        // M-01 fix: FAILED state must not allow minting of unbacked tokens while
+        // investors are actively claiming refunds via claimRefund().
         require(
-            state != State.MATURED && state != State.CLOSED,
-            "Bond: cannot mint after maturity"
+            state == State.SUBSCRIPTION || state == State.ACTIVE,
+            "Bond: mint only allowed during subscription or active"
         );
         // Keep couponEligibleSupply in sync so future coupons and redemptionRate
         // are calculated over the correct supply including agent-minted bonds.
@@ -1044,6 +1061,12 @@ contract CorporateBond is
 
     function _agentBurnBondTokens(address userAddress, uint256 amount) internal {
         require(balanceOf(userAddress) >= amount, "Bond: insufficient bonds");
+
+        // H-01 fix: accrue pending coupons before reducing balance so the investor
+        // does not permanently lose earned-but-unclaimed coupon funds on a forced burn.
+        if (terms.paymentMode == PaymentMode.COUPON && state == State.ACTIVE) {
+            _accrueCoupon(userAddress);
+        }
 
         uint256 freeBalance = balanceOf(userAddress) - _frozenTokens[userAddress];
         if (amount > freeBalance) {
