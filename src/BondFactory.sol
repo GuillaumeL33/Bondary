@@ -13,13 +13,22 @@ import {BondaryFeeCollector} from "./BondaryFeeCollector.sol";
  *         Tient un registre des bonds officiels utilisé par le Marketplace.
  *
  *         Rôles :
- *           DEFAULT_ADMIN_ROLE : peut changer l'implémentation et gérer les rôles
+ *           DEFAULT_ADMIN_ROLE : peut proposer un changement d'implémentation et gérer les rôles
  *           BOND_CREATOR_ROLE  : peut créer de nouveaux bonds (Bondary ops wallet)
+ *
+ *         H-02 fix : upgradeImplementation() était instantané (risque admin compromis).
+ *         Remplacé par un flux en deux étapes avec timelock 48h identique à CorporateBond.
  */
 contract BondFactory is AccessControl {
     bytes32 public constant BOND_CREATOR_ROLE = keccak256("BOND_CREATOR_ROLE");
 
+    uint256 public constant UPGRADE_DELAY = 48 hours;
+
     address public implementation;
+
+    // H-02 fix: two-step timelock for implementation upgrades.
+    address public pendingImplementation;
+    uint256 public pendingImplementationTimestamp;
 
     ComplianceManager   public immutable compliance;
     BondaryFeeCollector public immutable feeCollector;
@@ -34,6 +43,8 @@ contract BondFactory is AccessControl {
         string  symbol
     );
     event ImplementationUpgraded(address indexed oldImpl, address indexed newImpl);
+    event ImplementationProposed(address indexed newImpl, uint256 executableAt);
+    event ImplementationUpgradeCancelled(address indexed impl);
 
     constructor(
         address admin,
@@ -106,22 +117,56 @@ contract BondFactory is AccessControl {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  Admin
+    //  Admin — Implémentation (flux en deux étapes + timelock 48h)
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * @notice Met à jour l'implémentation utilisée pour les futurs bonds.
-     *         N'affecte PAS les proxies déjà déployés (chacun a son propre upgrade path).
+     * @notice Étape 1 : propose une nouvelle implémentation pour les futurs bonds.
+     *         L'exécution est bloquée 48h pour permettre une réaction en cas de compromis.
+     *         N'affecte PAS les proxies déjà déployés.
      */
-    function upgradeImplementation(address newImpl)
+    function proposeImplementation(address newImpl)
         external
         onlyRole(DEFAULT_ADMIN_ROLE)
     {
-        require(newImpl != address(0), "BondFactory: zero address");
-        require(newImpl.code.length > 0, "BondFactory: impl not contract");
+        require(pendingImplementation == address(0), "BondFactory: upgrade already pending");
+        require(newImpl != address(0),               "BondFactory: zero address");
+        require(newImpl.code.length > 0,             "BondFactory: impl not contract");
+        pendingImplementation = newImpl;
+        pendingImplementationTimestamp = block.timestamp + UPGRADE_DELAY;
+        emit ImplementationProposed(newImpl, pendingImplementationTimestamp);
+    }
+
+    /**
+     * @notice Étape 2 : exécute le changement d'implémentation après le timelock.
+     *         Appeler uniquement après les 48h de délai.
+     */
+    function executeImplementationUpgrade()
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(pendingImplementation != address(0),              "BondFactory: no upgrade pending");
+        require(block.timestamp >= pendingImplementationTimestamp, "BondFactory: upgrade timelocked");
         address old = implementation;
-        implementation = newImpl;
-        emit ImplementationUpgraded(old, newImpl);
+        implementation = pendingImplementation;
+        pendingImplementation = address(0);
+        pendingImplementationTimestamp = 0;
+        emit ImplementationUpgraded(old, implementation);
+    }
+
+    /**
+     * @notice Annule une proposition d'implémentation en cours.
+     *         Permet d'interrompre un upgrade suspecté malveillant avant son exécution.
+     */
+    function cancelImplementationUpgrade()
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        address cancelled = pendingImplementation;
+        require(cancelled != address(0), "BondFactory: no upgrade pending");
+        pendingImplementation = address(0);
+        pendingImplementationTimestamp = 0;
+        emit ImplementationUpgradeCancelled(cancelled);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
