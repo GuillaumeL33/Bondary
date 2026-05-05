@@ -178,6 +178,7 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
 
         CorporateBond cb = CorporateBond(order.bond);
         address paymentToken = cb.getTerms().paymentToken;
+        require(paymentToken != address(0), "Marketplace: zero payment token");
         address seller = order.seller;
         address bond = order.bond;
         uint256 bondAmount = order.bondAmount;
@@ -198,6 +199,7 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
 
         uint256 totalFees      = tradingFee + penaltyFee;
         uint256 sellerReceives = totalCost - totalFees;
+        require(sellerReceives > 0, "Marketplace: zero seller proceeds");
         order.active = false;
 
         // Paiement acheteur → vendeur (net de frais)

@@ -169,6 +169,7 @@ contract CorporateBond is
     event StateChanged(State indexed oldState, State indexed newState);
     event UpgradeProposed(address indexed implementation, uint256 executableAt);
     event UpgradeCancelled(address indexed implementation);
+    event IdentityRecoveryFallback(address indexed wallet, string action);
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Modifiers
@@ -910,6 +911,7 @@ contract CorporateBond is
         try _identityRegistry.registerIdentity(newWallet, recoveredIdentity, country) {}
         catch {
             require(_identityRegistry.isVerified(newWallet), "Bond: new wallet not compliant");
+            emit IdentityRecoveryFallback(newWallet, "registerIdentity");
         }
 
         uint256 recoveredBalance = balanceOf(lostWallet);
@@ -927,17 +929,21 @@ contract CorporateBond is
         }
 
         try _identityRegistry.deleteIdentity(lostWallet) {}
-        catch {}
+        catch {
+            emit IdentityRecoveryFallback(lostWallet, "deleteIdentity");
+        }
 
         emit RecoverySuccess(lostWallet, newWallet, investorOnchainID);
         return true;
     }
 
     function batchTransfer(address[] calldata toList, uint256[] calldata amounts) external override {
-        require(toList.length == amounts.length, "Bond: length mismatch");
-        require(toList.length <= MAX_BATCH_SIZE,  "Bond: batch too large");
-        for (uint256 i = 0; i < toList.length; i++) {
+        uint256 len = toList.length;
+        require(len == amounts.length, "Bond: length mismatch");
+        require(len <= MAX_BATCH_SIZE,  "Bond: batch too large");
+        for (uint256 i = 0; i < len;) {
             transfer(toList[i], amounts[i]);
+            unchecked { ++i; }
         }
     }
 
@@ -946,10 +952,12 @@ contract CorporateBond is
         address[] calldata toList,
         uint256[] calldata amounts
     ) external override {
-        require(fromList.length == toList.length && fromList.length == amounts.length, "Bond: length mismatch");
-        require(fromList.length <= MAX_BATCH_SIZE, "Bond: batch too large");
-        for (uint256 i = 0; i < fromList.length; i++) {
+        uint256 len = fromList.length;
+        require(len == toList.length && len == amounts.length, "Bond: length mismatch");
+        require(len <= MAX_BATCH_SIZE, "Bond: batch too large");
+        for (uint256 i = 0; i < len;) {
             forcedTransfer(fromList[i], toList[i], amounts[i]);
+            unchecked { ++i; }
         }
     }
 
