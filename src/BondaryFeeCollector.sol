@@ -55,6 +55,10 @@ contract BondaryFeeCollector is AccessControl {
     {
         require(token != address(0), "FeeCollector: zero token");
         require(amount > 0, "FeeCollector: zero amount");
+        require(
+            IERC20(token).balanceOf(address(this)) >= amount,
+            "FeeCollector: insufficient balance for fee"
+        );
         emit FeeReceived(msg.sender, token, amount, feeType);
     }
 

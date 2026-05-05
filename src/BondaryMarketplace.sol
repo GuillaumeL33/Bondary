@@ -99,6 +99,7 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
         uint256 _tradingFeeBps,
         uint256 _earlyExitPenaltyBps
     ) {
+        require(admin         != address(0), "Marketplace: zero admin");
         require(_compliance   != address(0), "Marketplace: zero compliance");
         require(_feeCollector != address(0), "Marketplace: zero feeCollector");
         require(_factory      != address(0), "Marketplace: zero factory");
@@ -137,6 +138,8 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
         require(compliance.isVerified(msg.sender),    "Marketplace: seller not compliant");
         require(bondAmount > 0,                       "Marketplace: zero amount");
         require(pricePerBond > 0,                     "Marketplace: zero price");
+        CorporateBond cb = CorporateBond(bond);
+        require(cb.state() == CorporateBond.State.ACTIVE, "Marketplace: bond not active");
         require(
             IERC20(bond).balanceOf(msg.sender) >= bondAmount,
             "Marketplace: insufficient bonds"
@@ -175,9 +178,12 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
 
         CorporateBond cb = CorporateBond(order.bond);
         address paymentToken = cb.getTerms().paymentToken;
+        address seller = order.seller;
+        address bond = order.bond;
+        uint256 bondAmount = order.bondAmount;
 
         // totalCost = bondAmount × pricePerBond (bonds ont 0 décimales)
-        uint256 totalCost = order.bondAmount * order.pricePerBond;
+        uint256 totalCost = bondAmount * order.pricePerBond;
         require(totalCost > 0, "Marketplace: zero cost");
 
         // Utilise le snapshot de frais enregistré à la création de l'ordre.
@@ -192,9 +198,10 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
 
         uint256 totalFees      = tradingFee + penaltyFee;
         uint256 sellerReceives = totalCost - totalFees;
+        order.active = false;
 
         // Paiement acheteur → vendeur (net de frais)
-        IERC20(paymentToken).safeTransferFrom(msg.sender, order.seller, sellerReceives);
+        IERC20(paymentToken).safeTransferFrom(msg.sender, seller, sellerReceives);
 
         // Paiement acheteur → FeeCollector
         if (totalFees > 0) {
@@ -212,17 +219,16 @@ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
         }
 
         // Transfert des bonds séquestrés → acheteur
-        IERC20(order.bond).safeTransfer(msg.sender, order.bondAmount);
+        IERC20(bond).safeTransfer(msg.sender, bondAmount);
 
-        order.active = false;
-        emit OrderFilled(orderId, msg.sender, order.bondAmount, totalCost, tradingFee, penaltyFee);
+        emit OrderFilled(orderId, msg.sender, bondAmount, totalCost, tradingFee, penaltyFee);
     }
 
     /**
      * @notice Annule un ordre et restitue les bonds au vendeur.
      *         Seul le vendeur ou un ADMIN peut annuler.
      */
-    function cancelOrder(uint256 orderId) external nonReentrant {
+    function cancelOrder(uint256 orderId) external nonReentrant whenNotPaused {
         Order storage order = orders[orderId];
         require(order.active, "Marketplace: order not active");
         require(
