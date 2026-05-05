@@ -164,9 +164,12 @@ contract CorporateBond is
     event EarlyBuybackOpened(uint256 totalFunds, uint256 ratePerBond);
     event EarlyBuybackRedeemed(address indexed investor, uint256 bonds, uint256 payment);
     event MaturityReached();
+    event EmergencyRedemptionSet(uint256 redemptionRatePerBond);
+    event EarlyBuybackPoolWithdrawn(uint256 amount);
     event StateChanged(State indexed oldState, State indexed newState);
     event UpgradeProposed(address indexed implementation, uint256 executableAt);
     event UpgradeCancelled(address indexed implementation);
+    event IdentityRecoveryFallback(address indexed wallet, string action);
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Modifiers
@@ -202,13 +205,6 @@ contract CorporateBond is
         __ReentrancyGuard_init();
         __UUPSUpgradeable_init();
 
-        _grantRole(DEFAULT_ADMIN_ROLE, admin);
-        _grantRole(ADMIN_ROLE, admin);
-        _grantRole(AGENT_ROLE, admin);
-        _grantRole(ISSUER_ROLE, _terms.issuer);
-        // AGENT_ROLE intentionally NOT granted to issuer — issuer is a counterparty,
-        // not a trusted operator. Bondary admin holds AGENT_ROLE for emergency ops.
-
         // Validations
         require(admin != address(0),                              "Bond: zero admin");
         require(_terms.totalIssuance > 0,                        "Bond: zero issuance");
@@ -230,6 +226,11 @@ contract CorporateBond is
         require(_feeCollector != address(0),                     "Bond: zero feeCollector");
         require(_setupFeeBps < BPS_DENOMINATOR,                  "Bond: setup fee >= 100%");
         require(_platformCouponFeeBps < BPS_DENOMINATOR,         "Bond: platform fee >= 100%");
+
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(ADMIN_ROLE, admin);
+        _grantRole(AGENT_ROLE, admin);
+        _grantRole(ISSUER_ROLE, _terms.issuer);
 
         _tokenName           = _name;
         _tokenSymbol         = _symbol;
@@ -326,7 +327,7 @@ contract CorporateBond is
         // Respecter le hard cap
         uint256 remaining = terms.totalIssuance - totalSubscribed;
         require(remaining > 0, "Bond: fully subscribed");
-        if (bondAmount > remaining) bondAmount = remaining;
+        require(bondAmount <= remaining, "Bond: exceeds remaining capacity");
 
         uint256 payment = bondAmount * terms.issuancePrice;
         require(payment >= terms.minInvestment, "Bond: below min investment");
@@ -399,7 +400,7 @@ contract CorporateBond is
         // Produit net → émetteur
         IERC20(terms.paymentToken).safeTransfer(terms.issuer, proceeds);
 
-        issueDate            = block.timestamp;
+        issueDate            = terms.subscriptionEnd;
         nextCouponDate       = block.timestamp + terms.couponFrequency;
         couponEligibleSupply = totalSubscribed;
 
@@ -650,6 +651,17 @@ contract CorporateBond is
         }
     }
 
+    function setEmergencyRedemptionRate(uint256 rate)
+        external
+        onlyRole(ADMIN_ROLE)
+        onlyState(State.MATURED)
+    {
+        require(redemptionRate == 0, "Bond: already repaid");
+        require(block.timestamp >= terms.maturityDate + 30 days, "Bond: grace period not expired");
+        redemptionRate = rate;
+        emit EmergencyRedemptionSet(rate);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     //  Rachat anticipé (optionnel, si earlyBuybackEnabled)
     // ─────────────────────────────────────────────────────────────────────────
@@ -670,6 +682,7 @@ contract CorporateBond is
         require(terms.earlyBuybackEnabled,  "Bond: buyback not enabled");
         require(totalFunds > 0,             "Bond: zero funds");
         require(ratePerBond > 0,            "Bond: zero rate");
+        require(ratePerBond <= type(uint256).max / PRECISION, "Bond: rate too high");
         require(block.timestamp < terms.maturityDate, "Bond: already matured");
 
         IERC20(terms.paymentToken).safeTransferFrom(msg.sender, address(this), totalFunds);
@@ -709,6 +722,18 @@ contract CorporateBond is
         IERC20(terms.paymentToken).safeTransfer(msg.sender, payout);
 
         emit EarlyBuybackRedeemed(msg.sender, bondAmount, payout);
+    }
+
+    function withdrawEarlyBuybackPool() external nonReentrant onlyRole(ISSUER_ROLE) {
+        require(
+            state == State.MATURED || state == State.CLOSED || state == State.FAILED,
+            "Bond: buyback pool still active"
+        );
+        uint256 remaining = earlyBuybackPool;
+        require(remaining > 0, "Bond: empty buyback pool");
+        earlyBuybackPool = 0;
+        IERC20(terms.paymentToken).safeTransfer(terms.issuer, remaining);
+        emit EarlyBuybackPoolWithdrawn(remaining);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -886,6 +911,7 @@ contract CorporateBond is
         try _identityRegistry.registerIdentity(newWallet, recoveredIdentity, country) {}
         catch {
             require(_identityRegistry.isVerified(newWallet), "Bond: new wallet not compliant");
+            emit IdentityRecoveryFallback(newWallet, "registerIdentity");
         }
 
         uint256 recoveredBalance = balanceOf(lostWallet);
@@ -903,17 +929,21 @@ contract CorporateBond is
         }
 
         try _identityRegistry.deleteIdentity(lostWallet) {}
-        catch {}
+        catch {
+            emit IdentityRecoveryFallback(lostWallet, "deleteIdentity");
+        }
 
         emit RecoverySuccess(lostWallet, newWallet, investorOnchainID);
         return true;
     }
 
     function batchTransfer(address[] calldata toList, uint256[] calldata amounts) external override {
-        require(toList.length == amounts.length, "Bond: length mismatch");
-        require(toList.length <= MAX_BATCH_SIZE,  "Bond: batch too large");
-        for (uint256 i = 0; i < toList.length; i++) {
+        uint256 len = toList.length;
+        require(len == amounts.length, "Bond: length mismatch");
+        require(len <= MAX_BATCH_SIZE,  "Bond: batch too large");
+        for (uint256 i = 0; i < len;) {
             transfer(toList[i], amounts[i]);
+            unchecked { ++i; }
         }
     }
 
@@ -922,10 +952,12 @@ contract CorporateBond is
         address[] calldata toList,
         uint256[] calldata amounts
     ) external override {
-        require(fromList.length == toList.length && fromList.length == amounts.length, "Bond: length mismatch");
-        require(fromList.length <= MAX_BATCH_SIZE, "Bond: batch too large");
-        for (uint256 i = 0; i < fromList.length; i++) {
+        uint256 len = fromList.length;
+        require(len == toList.length && len == amounts.length, "Bond: length mismatch");
+        require(len <= MAX_BATCH_SIZE, "Bond: batch too large");
+        for (uint256 i = 0; i < len;) {
             forcedTransfer(fromList[i], toList[i], amounts[i]);
+            unchecked { ++i; }
         }
     }
 
@@ -998,6 +1030,7 @@ contract CorporateBond is
 
     function cancelUpgrade() external onlyRole(DEFAULT_ADMIN_ROLE) {
         address oldPending = pendingUpgradeImpl;
+        require(oldPending != address(0), "Bond: no upgrade pending");
         pendingUpgradeImpl = address(0);
         pendingUpgradeTimestamp = 0;
         emit UpgradeCancelled(oldPending);
@@ -1050,8 +1083,10 @@ contract CorporateBond is
 
     function _burnBondTokens(address userAddress, uint256 amount) internal {
         require(balanceOf(userAddress) >= amount, "Bond: insufficient bonds");
-        require(_identityRegistry.isVerified(userAddress), "Bond: holder not compliant");
-        require(!_frozen[userAddress], "Bond: wallet frozen");
+        if (state == State.ACTIVE) {
+            require(_identityRegistry.isVerified(userAddress), "Bond: holder not compliant");
+            require(!_frozen[userAddress], "Bond: wallet frozen");
+        }
         require(amount <= balanceOf(userAddress) - _frozenTokens[userAddress], "Bond: insufficient free balance");
 
         _decreaseCouponEligibleSupply(amount);
