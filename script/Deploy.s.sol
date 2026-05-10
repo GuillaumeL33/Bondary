@@ -10,21 +10,26 @@ import {BondaryMarketplace} from "../src/BondaryMarketplace.sol";
 
 /**
  * @title Deploy
- * @notice Script de déploiement de l'infrastructure Bondary v2 (Corporate Bond Tokenization).
+ * @notice Deploy the Bondary stack on mainnet networks (Polygon / Ethereum).
+ *         For Sepolia testnet, use DeploySepolia.s.sol which also deploys
+ *         MockUSDC / MockEURC.
  *
- * Pré-requis (variables d'environnement) :
- *   DEPLOYER_PRIVATE_KEY : clé privée du compte déployeur
- *   BONDARY_ADMIN        : adresse du Gnosis Safe (multisig 2/3 minimum)
+ * Required env:
+ *   DEPLOYER_PRIVATE_KEY : deployer private key
+ *   BONDARY_ADMIN        : Gnosis Safe address (≥2/3 multisig)
  *
- * Ordre de déploiement :
- *   1. ComplianceManager   — registre KYC/AML global (remplace BondaryWhitelist)
- *   2. BondaryFeeCollector — collecteur de frais plateforme
- *   3. CorporateBond impl  — implémentation logique UUPS (jamais utilisée directement)
- *   4. BondFactory         — factory de proxies ERC1967
- *   5. BondaryMarketplace  — marché secondaire order book
- *   6. Whitelist le marketplace dans ComplianceManager (reçoit des security tokens)
+ * Deployment order:
+ *   1. ComplianceManager   — KYC/AML registry
+ *   2. BondaryFeeCollector — platform fee collector
+ *   3. CorporateBond impl  — UUPS implementation (never used directly)
+ *   4. BondFactory         — ERC1967 proxy factory
+ *   5. BondaryMarketplace  — secondary order book
+ *   6. Whitelist marketplace in ComplianceManager
+ *   7. Grant COMPLIANCE_ADMIN_ROLE to factory (S-05: it binds new bonds)
+ *   8. Grant DEFAULT_ADMIN_ROLE to factory on FeeCollector (auto-grants bonds)
+ *   9. Grant AUTHORIZED_SOURCE_ROLE to marketplace
  *
- * Usage :
+ * Usage:
  *   forge script script/Deploy.s.sol \
  *     --rpc-url $POLYGON_RPC_URL \
  *     --broadcast \
@@ -32,12 +37,10 @@ import {BondaryMarketplace} from "../src/BondaryMarketplace.sol";
  *     -vvvv
  */
 contract Deploy is Script {
-    // ─── Configuration plateforme ─────────────────────────────────────────────
-
-    uint256 constant SETUP_FEE_BPS          = 100;  // 1.0% frais de dossier
-    uint256 constant PLATFORM_COUPON_FEE_BPS = 50;  // 0.5% frais sur coupons/intérêts
-    uint256 constant TRADING_FEE_BPS        = 50;   // 0.5% frais AMM
-    uint256 constant EARLY_EXIT_PENALTY_BPS = 200;  // 2.0% pénalité sortie anticipée
+    uint256 constant SETUP_FEE_BPS           = 100;  // 1.0%
+    uint256 constant PLATFORM_COUPON_FEE_BPS = 50;   // 0.5%
+    uint256 constant TRADING_FEE_BPS         = 50;   // 0.5%
+    uint256 constant EARLY_EXIT_PENALTY_BPS  = 200;  // 2.0%
 
     function run() external {
         address admin   = vm.envAddress("BONDARY_ADMIN");
@@ -45,45 +48,32 @@ contract Deploy is Script {
 
         vm.startBroadcast(privKey);
 
-        // 1. ComplianceManager (KYC/AML)
         ComplianceManager cm = new ComplianceManager(admin);
         console2.log("ComplianceManager  :", address(cm));
 
-        // 2. Fee Collector
         BondaryFeeCollector fc = new BondaryFeeCollector(admin);
         console2.log("BondaryFeeCollector:", address(fc));
 
-        // 3. CorporateBond implementation (logique uniquement, _disableInitializers())
         CorporateBond impl = new CorporateBond();
         console2.log("CorporateBond impl :", address(impl));
 
-        // 4. BondFactory
         BondFactory factory = new BondFactory(admin, address(impl), address(cm), address(fc));
         console2.log("BondFactory        :", address(factory));
 
-        // Grant factory DEFAULT_ADMIN_ROLE on feeCollector so it can auto-grant
-        // AUTHORIZED_SOURCE_ROLE to each bond it deploys via createBond().
+        // Factory can grant AUTHORIZED_SOURCE_ROLE to bonds it deploys.
         fc.grantRole(fc.DEFAULT_ADMIN_ROLE(), address(factory));
 
-        // 5. BondaryMarketplace
+        // S-05 : factory can bind new bonds on ComplianceManager.
+        cm.grantRole(cm.COMPLIANCE_ADMIN_ROLE(), address(factory));
+
         BondaryMarketplace marketplace = new BondaryMarketplace(
-            admin,
-            address(cm),
-            address(fc),
-            address(factory),
-            TRADING_FEE_BPS,
-            EARLY_EXIT_PENALTY_BPS
+            admin, address(cm), address(fc), address(factory),
+            TRADING_FEE_BPS, EARLY_EXIT_PENALTY_BPS
         );
         console2.log("BondaryMarketplace :", address(marketplace));
 
-        // 6. Whitelist le marketplace dans ComplianceManager
-        //    (il reçoit des security tokens lors du séquestre des ordres)
         cm.whitelist(address(marketplace));
-        console2.log("Marketplace whiteliste dans ComplianceManager");
-
-        // 7. Autoriser le marketplace à notifier les frais dans FeeCollector
         fc.grantRole(fc.AUTHORIZED_SOURCE_ROLE(), address(marketplace));
-        console2.log("Marketplace autorise dans BondaryFeeCollector");
 
         vm.stopBroadcast();
 
