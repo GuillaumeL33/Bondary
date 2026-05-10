@@ -9,24 +9,24 @@ import {BondaryFeeCollector} from "./BondaryFeeCollector.sol";
 
 /**
  * @title BondFactory
- * @notice Déploie des proxies ERC1967 pointant vers l'implémentation CorporateBond.
- *         Tient un registre des bonds officiels utilisé par le Marketplace.
+ * @notice Deploys ERC1967 proxies pointing to the CorporateBond implementation.
+ *         Maintains a registry of official bonds used by the marketplace.
  *
- *         Rôles :
- *           DEFAULT_ADMIN_ROLE : peut proposer un changement d'implémentation et gérer les rôles
- *           BOND_CREATOR_ROLE  : peut créer de nouveaux bonds (Bondary ops wallet)
- *
- *         H-02 fix : upgradeImplementation() était instantané (risque admin compromis).
- *         Remplacé par un flux en deux étapes avec timelock 48h identique à CorporateBond.
+ * --- Audit fixes -------------------------------------------------------------
+ *   H-02  upgradeImplementation() in two steps with timelock
+ *   S-04  UPGRADE_DELAY 48h -> 7 days (aligned with CorporateBond)
+ *   S-05  createBond() calls compliance.bindToken() after deployment
+ *   S-08  allBonds(offset, limit) paginated to avoid gas DoS
+ * ----------------------------------------------------------------------------
  */
 contract BondFactory is AccessControl {
     bytes32 public constant BOND_CREATOR_ROLE = keccak256("BOND_CREATOR_ROLE");
 
-    uint256 public constant UPGRADE_DELAY = 48 hours;
+    /// @notice S-04 : aligned on CorporateBond.UPGRADE_DELAY (industry standard 7-14d).
+    uint256 public constant UPGRADE_DELAY = 7 days;
 
     address public implementation;
 
-    // H-02 fix: two-step timelock for implementation upgrades.
     address public pendingImplementation;
     uint256 public pendingImplementationTimestamp;
 
@@ -66,20 +66,13 @@ contract BondFactory is AccessControl {
         feeCollector   = BondaryFeeCollector(_feeCollector);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Factory
-    // ─────────────────────────────────────────────────────────────────────────
+    // ------- Factory ---------------------------------------------------------
 
-    /**
-     * @notice Déploie un nouveau CorporateBond via un proxy ERC1967.
-     * @param name                 Nom ERC-20 du bond token
-     * @param symbol               Symbole ERC-20 du bond token
-     * @param bondTerms            Paramètres économiques de l'obligation
-     * @param setupFeeBps          Frais de dossier en BPS (ex: 100 = 1%)
-     * @param platformCouponFeeBps Frais plateforme sur coupons en BPS
-     * @param bondAdmin            Admin du bond (reçoit ADMIN_ROLE + DEFAULT_ADMIN_ROLE)
-     * @return bondProxy           Adresse du proxy déployé
-     */
+    /// @notice Deploys a new CorporateBond via an ERC1967 proxy.
+    ///         Requires:
+    ///           * COMPLIANCE_ADMIN_ROLE on ComplianceManager (binds new bonds)
+    ///           * DEFAULT_ADMIN_ROLE on BondaryFeeCollector (auto-grants AUTHORIZED_SOURCE_ROLE)
+    ///         Both roles are granted to this factory in Deploy.s.sol.
     function createBond(
         string memory name,
         string memory symbol,
@@ -90,6 +83,7 @@ contract BondFactory is AccessControl {
     ) external onlyRole(BOND_CREATOR_ROLE) returns (address bondProxy) {
         require(bondAdmin != address(0), "BondFactory: zero bondAdmin");
         require(bondTerms.issuer != address(0), "BondFactory: zero issuer");
+
         bytes memory initData = abi.encodeCall(
             CorporateBond.initialize,
             (
@@ -110,21 +104,17 @@ contract BondFactory is AccessControl {
         _officialBonds[bondProxy] = true;
         _allBonds.push(bondProxy);
 
-        // Grant AUTHORIZED_SOURCE_ROLE so the bond can call feeCollector.notifyFeeReceived()
+        // S-05 : bind the new bond on ComplianceManager.
+        compliance.bindToken(bondProxy);
+
+        // Grant AUTHORIZED_SOURCE_ROLE so the bond can call feeCollector.notifyFeeReceived().
         feeCollector.grantRole(feeCollector.AUTHORIZED_SOURCE_ROLE(), bondProxy);
 
         emit BondCreated(bondProxy, bondTerms.issuer, name, symbol);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Admin — Implémentation (flux en deux étapes + timelock 48h)
-    // ─────────────────────────────────────────────────────────────────────────
+    // ------- Implementation upgrade (two-step + 7d timelock) -----------------
 
-    /**
-     * @notice Étape 1 : propose une nouvelle implémentation pour les futurs bonds.
-     *         L'exécution est bloquée 48h pour permettre une réaction en cas de compromis.
-     *         N'affecte PAS les proxies déjà déployés.
-     */
     function proposeImplementation(address newImpl)
         external
         onlyRole(DEFAULT_ADMIN_ROLE)
@@ -137,10 +127,6 @@ contract BondFactory is AccessControl {
         emit ImplementationProposed(newImpl, pendingImplementationTimestamp);
     }
 
-    /**
-     * @notice Étape 2 : exécute le changement d'implémentation après le timelock.
-     *         Appeler uniquement après les 48h de délai.
-     */
     function executeImplementationUpgrade()
         external
         onlyRole(DEFAULT_ADMIN_ROLE)
@@ -154,10 +140,6 @@ contract BondFactory is AccessControl {
         emit ImplementationUpgraded(old, implementation);
     }
 
-    /**
-     * @notice Annule une proposition d'implémentation en cours.
-     *         Permet d'interrompre un upgrade suspecté malveillant avant son exécution.
-     */
     function cancelImplementationUpgrade()
         external
         onlyRole(DEFAULT_ADMIN_ROLE)
@@ -169,16 +151,34 @@ contract BondFactory is AccessControl {
         emit ImplementationUpgradeCancelled(cancelled);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Views
-    // ─────────────────────────────────────────────────────────────────────────
+    // ------- Views -----------------------------------------------------------
 
     function isOfficialBond(address bond) external view returns (bool) {
         return _officialBonds[bond];
     }
 
+    /// @notice Legacy: returns all bonds. Use allBondsPaged() once the list grows.
     function allBonds() external view returns (address[] memory) {
         return _allBonds;
+    }
+
+    /// @notice S-08 : paginated read of the bond list.
+    function allBondsPaged(uint256 offset, uint256 limit)
+        external
+        view
+        returns (address[] memory page, uint256 total)
+    {
+        total = _allBonds.length;
+        if (offset >= total || limit == 0) {
+            return (new address[](0), total);
+        }
+        uint256 end = offset + limit;
+        if (end > total) end = total;
+        uint256 count = end - offset;
+        page = new address[](count);
+        for (uint256 i = 0; i < count; i++) {
+            page[i] = _allBonds[offset + i];
+        }
     }
 
     function bondCount() external view returns (uint256) {
