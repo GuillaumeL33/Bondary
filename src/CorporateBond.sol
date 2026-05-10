@@ -16,48 +16,16 @@ import {IERC3643, ICompliance, IIdentity, IIdentityRegistry} from "./interfaces/
  * @title CorporateBond
  * @notice Token ERC-20 representant une obligation corporate tokenisee.
  *
- *  Modele economique :
- *    1 bond token = 1 unite de nominal (ex: 1 USDC de dette).
- *    Les tokens representent une creance, pas une part de vault.
- *    Decimales = 0 -> chaque token est une obligation entiere.
- *
- *  Cycle de vie :
- *    SUBSCRIPTION -> souscription ouverte (investisseurs deposent les fonds)
- *    ACTIVE       -> emission validee, tokens mintes, fonds verses a l'emetteur
- *    MATURED      -> maturite atteinte, remboursement du principal possible
- *    CLOSED       -> tous les tokens rachetes, obligation cloturee
- *    FAILED       -> soft cap non atteint, remboursement integral des souscripteurs
- *
- *  Deux modes de paiement configurables a l'emission :
- *    COUPON : interets verses periodiquement (trimestre/semestre/annuel)
- *             + principal rembourse a maturite
- *    BULLET : aucun paiement intermediaire, principal + interets totaux a maturite
- *
- *  Security token (MiFID II) :
- *    Tous les transferts verifient ComplianceManager.isVerified() pour from ET to.
- *    Seules les adresses KYC validees et non blacklistees peuvent detenir le token.
- *
- *  Coupon accrual (mode COUPON) :
- *    Pattern "dividend per token" : les coupons s'accumulent dans un compteur global
- *    totalCouponPerToken. Chaque transfert declenche l'accrual pour les deux parties.
- *    Les investisseurs reclament leurs coupons accumules via claimCoupons().
- *
  *  --- Audit H1 fixes (mai 2026) ---------------------------------------------
- *    S-01  repayPrincipal() paie automatiquement le coupon-stub pour la periode
- *          [lastCouponDate, maturityDate]. Avant : prorata perdu pour les
- *          investisseurs. Voir finalCouponPaid + repayPrincipal() ci-dessous.
- *
- *    S-02  mint() AGENT plafonne a AGENT_MINT_CAP_BPS (1%) de totalIssuance par
- *          fenetre glissante de 24h. Evite la dilution massive si AGENT_ROLE
- *          est compromis. SUBSCRIPTION : pas de cap (phase d'allocation).
- *
- *    S-03  setEmergencyRedemptionRate remplacee par flux propose/execute avec
- *          timelock 7 jours. Empeche un admin compromis de fixer un taux
- *          arbitrairement bas et de le declencher immediatement.
- *
- *    S-04  UPGRADE_DELAY 48h -> 7 jours. Aligne sur les standards de l'industrie
- *          security token (Securitize, Maple, Tokeny T-REX) qui utilisent 7-14j
- *          minimum pour les contrats detenant des fonds investisseurs.
+ *    S-01  repayPrincipal() paie automatiquement le coupon-stub final.
+ *    S-02  mint() AGENT plafonne a 1% de totalIssuance par fenetre 24h.
+ *    S-03  setEmergencyRedemptionRate -> propose/execute timelock 7 jours.
+ *    S-04  UPGRADE_DELAY 48h -> 7 jours.
+ *    S-05  Bond ne se binde plus lui-meme (factory s'en charge).
+ *  --- H1 hotfix (Remix compile) ---------------------------------------------
+ *    - Supprime __UUPSUpgradeable_init() (retire en OpenZeppelin v5).
+ *    - Split initialize() en _validateInitArgs / _grantInitRoles / _initStorage
+ *      pour rester sous la limite de 16 slots EVM SANS viaIR.
  *  --------------------------------------------------------------------------
  */
 contract CorporateBond is
@@ -81,27 +49,14 @@ contract CorporateBond is
 
     uint256 public constant BPS_DENOMINATOR  = 10_000;
     uint256 public constant YEAR_IN_SECONDS  = 365 days;
-    uint256 public constant MAX_BATCH_SIZE   = 200;    // DoS protection on batch calls
+    uint256 public constant MAX_BATCH_SIZE   = 200;
     uint256 public constant PRECISION        = 1e18;
     string  public constant TOKEN_VERSION    = "1.1.0-erc3643";
 
-    /// @notice S-04 fix: timelock pour les upgrades UUPS. Aligne sur les standards
-    ///         de l'industrie security token (Securitize, Tokeny T-REX, Maple).
-    uint256 public constant UPGRADE_DELAY = 7 days;
-
-    /// @notice S-02 fix: plafond de mint AGENT_ROLE par fenetre glissante de 24h,
-    ///         exprime en BPS de terms.totalIssuance. Empeche la dilution massive
-    ///         si AGENT_ROLE est compromis.
-    uint256 public constant AGENT_MINT_CAP_BPS = 100; // 1.0% de totalIssuance par jour
-
-    /// @notice S-03 fix: timelock sur la fixation du taux de remboursement
-    ///         d'urgence. Donne 7 jours aux investisseurs pour reagir si le taux
-    ///         propose est manifestement injuste.
+    uint256 public constant UPGRADE_DELAY              = 7 days;
+    uint256 public constant AGENT_MINT_CAP_BPS         = 100;     // 1.0% par jour
     uint256 public constant EMERGENCY_REDEMPTION_DELAY = 7 days;
-
-    /// @notice Periode de grace apres la maturite avant qu'un taux d'urgence
-    ///         puisse etre propose (l'emetteur garde 30j pour deposer le principal).
-    uint256 public constant EMERGENCY_GRACE_PERIOD = 30 days;
+    uint256 public constant EMERGENCY_GRACE_PERIOD     = 30 days;
 
     // -------------------------------------------------------------------------
     //  Types
@@ -112,19 +67,19 @@ contract CorporateBond is
     enum PaymentMode { COUPON, BULLET }
 
     struct BondTerms {
-        uint256 faceValue;           // USDC_wei par bond entier (ex: 1e6 = 1 USDC)
-        uint256 totalIssuance;       // nombre total de bonds a emettre (entiers)
-        uint256 softCap;             // minimum de bonds pour valider la levee
-        uint256 issuancePrice;       // USDC_wei par bond a la souscription
-        uint256 minInvestment;       // montant minimum en USDC_wei (ex: 50e6 = 50 USDC)
-        uint256 couponRate;          // taux annuel en BPS (ex: 800 = 8.00 %)
-        uint256 maturityDate;        // timestamp d'echeance
-        uint256 couponFrequency;     // intervalle en secondes (ex: 90 days = trimestriel)
-        PaymentMode paymentMode;     // COUPON ou BULLET
-        bool earlyBuybackEnabled;    // l'emetteur peut-il racheter avant maturite ?
-        uint256 subscriptionEnd;     // timestamp de fin de souscription
-        address paymentToken;        // USDC ou EURC
-        address issuer;              // adresse de l'emetteur (recoit les fonds leves)
+        uint256 faceValue;
+        uint256 totalIssuance;
+        uint256 softCap;
+        uint256 issuancePrice;
+        uint256 minInvestment;
+        uint256 couponRate;
+        uint256 maturityDate;
+        uint256 couponFrequency;
+        PaymentMode paymentMode;
+        bool earlyBuybackEnabled;
+        uint256 subscriptionEnd;
+        address paymentToken;
+        address issuer;
     }
 
     // -------------------------------------------------------------------------
@@ -170,19 +125,13 @@ contract CorporateBond is
     address public pendingUpgradeImpl;
     uint256 public pendingUpgradeTimestamp;
 
-    // --- H1 storage additions -------------------------------------------------
-    /// @notice S-02 : debut de la fenetre glissante 24h pour le cap de mint AGENT.
+    // --- H1 storage additions
     uint256 private _agentMintWindowStart;
-    /// @notice S-02 : montant minte par AGENT dans la fenetre courante.
     uint256 private _agentMintInWindow;
-    /// @notice S-01 : drapeau anti-double-paiement du coupon-stub final.
     bool public finalCouponPaid;
-    /// @notice S-03 : taux de remboursement d'urgence propose en attente.
     uint256 public proposedEmergencyRedemptionRate;
-    /// @notice S-03 : timestamp a partir duquel la proposition peut etre executee.
     uint256 public proposedEmergencyRedemptionTimestamp;
 
-    // Reserved storage slots for future upgrades. H1: shrunk from 50 to 45.
     uint256[45] private __gap;
 
     // -------------------------------------------------------------------------
@@ -238,8 +187,26 @@ contract CorporateBond is
         __AccessControl_init();
         __Pausable_init();
         __ReentrancyGuard_init();
-        __UUPSUpgradeable_init();
+        // __UUPSUpgradeable_init() is removed in OpenZeppelin v5 — no state to init.
 
+        _validateInitArgs(_terms, _setupFeeBps, _platformCouponFeeBps, _feeCollector, admin);
+        _grantInitRoles(_terms.issuer, admin);
+        _initStorage(_name, _symbol, _terms, _setupFeeBps, _platformCouponFeeBps, _feeCollector);
+
+        _setIdentityRegistry(_compliance);
+        _setComplianceInitial(_compliance);
+        emit UpdatedTokenInformation(_tokenName, _tokenSymbol, decimals(), TOKEN_VERSION, _tokenOnchainID);
+    }
+
+    /// @dev Split out of `initialize` to keep the stack within the 16-slot
+    ///      EVM limit when compiling without `viaIR` (e.g. default Remix).
+    function _validateInitArgs(
+        BondTerms calldata _terms,
+        uint256 _setupFeeBps,
+        uint256 _platformCouponFeeBps,
+        address _feeCollector,
+        address admin
+    ) private view {
         require(admin != address(0),                              "Bond: zero admin");
         require(_terms.totalIssuance > 0,                        "Bond: zero issuance");
         require(_terms.softCap <= _terms.totalIssuance,          "Bond: softCap > totalIssuance");
@@ -259,12 +226,23 @@ contract CorporateBond is
         require(_feeCollector != address(0),                     "Bond: zero feeCollector");
         require(_setupFeeBps < BPS_DENOMINATOR,                  "Bond: setup fee >= 100%");
         require(_platformCouponFeeBps < BPS_DENOMINATOR,         "Bond: platform fee >= 100%");
+    }
 
+    function _grantInitRoles(address issuer_, address admin) private {
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(ADMIN_ROLE, admin);
         _grantRole(AGENT_ROLE, admin);
-        _grantRole(ISSUER_ROLE, _terms.issuer);
+        _grantRole(ISSUER_ROLE, issuer_);
+    }
 
+    function _initStorage(
+        string memory _name,
+        string memory _symbol,
+        BondTerms calldata _terms,
+        uint256 _setupFeeBps,
+        uint256 _platformCouponFeeBps,
+        address _feeCollector
+    ) private {
         _tokenName           = _name;
         _tokenSymbol         = _symbol;
         terms                = _terms;
@@ -272,10 +250,6 @@ contract CorporateBond is
         platformCouponFeeBps = _platformCouponFeeBps;
         feeCollector         = BondaryFeeCollector(_feeCollector);
         state                = State.SUBSCRIPTION;
-
-        _setIdentityRegistry(_compliance);
-        _setComplianceInitial(_compliance);
-        emit UpdatedTokenInformation(_tokenName, _tokenSymbol, decimals(), TOKEN_VERSION, _tokenOnchainID);
     }
 
     function decimals() public pure override returns (uint8) { return 0; }
@@ -494,8 +468,6 @@ contract CorporateBond is
         emit BulletRepaid(totalNet + platformFee, platformFee);
     }
 
-    /// @notice (Mode COUPON) Repay principal + S-01 stub coupon for the period
-    ///         [lastCouponDate, maturityDate].
     function repayPrincipal() external nonReentrant onlyRole(ISSUER_ROLE) {
         require(terms.paymentMode == PaymentMode.COUPON, "Bond: not coupon mode");
         require(state == State.ACTIVE || state == State.MATURED, "Bond: invalid state");
@@ -504,29 +476,7 @@ contract CorporateBond is
         require(redemptionRate == 0, "Bond: already repaid");
 
         if (!finalCouponPaid) {
-            uint256 lastCouponDate = couponsPaid == 0
-                ? issueDate
-                : nextCouponDate - terms.couponFrequency;
-
-            if (terms.maturityDate > lastCouponDate) {
-                uint256 stubPeriod = terms.maturityDate - lastCouponDate;
-                uint256 stubGross  = (couponEligibleSupply * terms.faceValue * terms.couponRate * stubPeriod) /
-                    (BPS_DENOMINATOR * YEAR_IN_SECONDS);
-
-                if (stubGross > 0) {
-                    uint256 stubFee = (stubGross * platformCouponFeeBps) / BPS_DENOMINATOR;
-                    uint256 stubNet = stubGross - stubFee;
-
-                    IERC20(terms.paymentToken).safeTransferFrom(msg.sender, address(this), stubNet);
-                    if (stubFee > 0) {
-                        IERC20(terms.paymentToken).safeTransferFrom(msg.sender, address(feeCollector), stubFee);
-                        feeCollector.notifyFeeReceived(terms.paymentToken, stubFee, BondaryFeeCollector.FeeType.COUPON);
-                    }
-                    totalCouponPerToken += (stubNet * PRECISION) / couponEligibleSupply;
-                    couponsPaid++;
-                    emit FinalCouponPaid(couponsPaid, stubPeriod, stubGross, stubFee);
-                }
-            }
+            _payFinalStubCoupon();
             finalCouponPaid = true;
         }
 
@@ -535,6 +485,31 @@ contract CorporateBond is
         redemptionRate = (principal * PRECISION) / couponEligibleSupply;
         if (state == State.ACTIVE) _changeState(State.MATURED);
         emit PrincipalRepaid(principal);
+    }
+
+    /// @dev S-01 stub coupon, extracted to keep `repayPrincipal` stack shallow.
+    function _payFinalStubCoupon() private {
+        uint256 lastCouponDate = couponsPaid == 0
+            ? issueDate
+            : nextCouponDate - terms.couponFrequency;
+        if (terms.maturityDate <= lastCouponDate) return;
+
+        uint256 stubPeriod = terms.maturityDate - lastCouponDate;
+        uint256 stubGross  = (couponEligibleSupply * terms.faceValue * terms.couponRate * stubPeriod) /
+            (BPS_DENOMINATOR * YEAR_IN_SECONDS);
+        if (stubGross == 0) return;
+
+        uint256 stubFee = (stubGross * platformCouponFeeBps) / BPS_DENOMINATOR;
+        uint256 stubNet = stubGross - stubFee;
+
+        IERC20(terms.paymentToken).safeTransferFrom(msg.sender, address(this), stubNet);
+        if (stubFee > 0) {
+            IERC20(terms.paymentToken).safeTransferFrom(msg.sender, address(feeCollector), stubFee);
+            feeCollector.notifyFeeReceived(terms.paymentToken, stubFee, BondaryFeeCollector.FeeType.COUPON);
+        }
+        totalCouponPerToken += (stubNet * PRECISION) / couponEligibleSupply;
+        couponsPaid++;
+        emit FinalCouponPaid(couponsPaid, stubPeriod, stubGross, stubFee);
     }
 
     // ------- REDEEM ----------------------------------------------------------
@@ -686,7 +661,6 @@ contract CorporateBond is
         return principal + interest;
     }
 
-    /// @notice S-01 : amount of the final stub coupon, post-maturity.
     function expectedFinalCouponAmount() external view returns (uint256) {
         if (terms.paymentMode != PaymentMode.COUPON) return 0;
         if (finalCouponPaid) return 0;
@@ -714,7 +688,6 @@ contract CorporateBond is
     function getTerms() external view returns (BondTerms memory) { return terms; }
     function totalRaised() external view returns (uint256) { return totalPaymentReceived; }
 
-    /// @notice S-02 : remaining cap that AGENT_ROLE can mint in the current 24h window.
     function remainingAgentMintCap() external view returns (uint256) {
         if (state != State.ACTIVE) return type(uint256).max;
         uint256 cap = (terms.totalIssuance * AGENT_MINT_CAP_BPS) / BPS_DENOMINATOR;
@@ -780,7 +753,6 @@ contract CorporateBond is
         return true;
     }
 
-    /// @notice S-02 : agent mint capped at AGENT_MINT_CAP_BPS of totalIssuance per 24h.
     function mint(address to, uint256 amount) public override onlyRole(AGENT_ROLE) {
         require(
             state == State.SUBSCRIPTION || state == State.ACTIVE,
@@ -824,6 +796,18 @@ contract CorporateBond is
             emit IdentityRecoveryFallback(newWallet, "registerIdentity");
         }
 
+        _moveTokensOnRecovery(lostWallet, newWallet);
+
+        try _identityRegistry.deleteIdentity(lostWallet) {} catch {
+            emit IdentityRecoveryFallback(lostWallet, "deleteIdentity");
+        }
+        emit RecoverySuccess(lostWallet, newWallet, investorOnchainID);
+        return true;
+    }
+
+    /// @dev Extracted from `recoveryAddress` to keep the stack within EVM's
+    ///      16-slot limit when compiling without viaIR.
+    function _moveTokensOnRecovery(address lostWallet, address newWallet) private {
         uint256 recoveredBalance = balanceOf(lostWallet);
         uint256 frozenAmount = _frozenTokens[lostWallet];
         bool wasFrozen = _frozen[lostWallet];
@@ -837,11 +821,6 @@ contract CorporateBond is
             _frozen[newWallet] = true;
             emit AddressFrozen(newWallet, true, msg.sender);
         }
-        try _identityRegistry.deleteIdentity(lostWallet) {} catch {
-            emit IdentityRecoveryFallback(lostWallet, "deleteIdentity");
-        }
-        emit RecoverySuccess(lostWallet, newWallet, investorOnchainID);
-        return true;
     }
 
     function batchTransfer(address[] calldata toList, uint256[] calldata amounts) external override {
@@ -919,7 +898,6 @@ contract CorporateBond is
     function pause() external override onlyRole(AGENT_ROLE) { _pause(); }
     function unpause() external override onlyRole(AGENT_ROLE) { _unpause(); }
 
-    /// @notice S-04 : propose a new implementation. Execution timelock 7 days.
     function proposeUpgrade(address newImplementation) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(pendingUpgradeImpl == address(0), "Bond: upgrade already pending");
         require(newImplementation != address(0), "Bond: zero implementation");
@@ -943,15 +921,12 @@ contract CorporateBond is
         emit IdentityRegistryAdded(newIdentityRegistry);
     }
 
-    /// @dev S-05 : initialize-only path. Bond does NOT bind itself; BondFactory does.
     function _setComplianceInitial(address newCompliance) internal {
         require(newCompliance != address(0), "Bond: zero compliance");
         _tokenCompliance = ICompliance(newCompliance);
         emit ComplianceAdded(newCompliance);
     }
 
-    /// @dev S-05 : post-init switch. Requires the new compliance to already declare
-    ///      this token bound. Admin must orchestrate the bind in a separate tx.
     function _setCompliance(address newCompliance) internal {
         require(newCompliance != address(0), "Bond: zero compliance");
         if (address(_tokenCompliance) != address(0)) {
