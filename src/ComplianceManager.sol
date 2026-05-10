@@ -8,18 +8,24 @@ import {ICompliance, IIdentity, IIdentityRegistry} from "./interfaces/IERC3643.s
  * @title ComplianceManager
  * @notice ERC-3643-compatible identity registry and compliance module.
  *
- * This implementation keeps Bondary's simple KYC/AML workflow while exposing
- * the ERC-3643 hooks expected by a permissioned token:
- * - Identity Registry: wallet -> ONCHAINID + country + verification status.
- * - Compliance: transfer pre-checks and lifecycle callbacks.
+ * --- Audit H1 fixes (mai 2026) -----------------------------------------------
+ *  S-05  bindToken() restricted to COMPLIANCE_ADMIN_ROLE. The msg.sender ==
+ *        token shortcut is removed: any contract could otherwise self-bind
+ *        and emit misleading TokenBound events. BondFactory receives
+ *        COMPLIANCE_ADMIN_ROLE and binds each bond proxy after deployment.
  *
- * For production ONCHAINID claim validation, wire the stored identity addresses
- * to a claim topic/trusted issuer stack or replace this contract with a full
- * T-REX IdentityRegistry + ModularCompliance deployment.
+ *  S-06  _registerIdentity() validates IIdentity when it differs from the
+ *        wallet. A real ONCHAINID must declare a MANAGEMENT key (purpose 1)
+ *        for the investor wallet. Simplified mode (whitelist legacy where
+ *        identity == wallet) keeps its prior behavior.
+ * ----------------------------------------------------------------------------
  */
 contract ComplianceManager is AccessControl, IIdentityRegistry, ICompliance {
     bytes32 public constant KYC_OPERATOR_ROLE = keccak256("KYC_OPERATOR_ROLE");
     bytes32 public constant COMPLIANCE_ADMIN_ROLE = keccak256("COMPLIANCE_ADMIN_ROLE");
+
+    /// @dev ERC-734 purpose 1 = MANAGEMENT (per ONCHAINID convention).
+    uint256 internal constant ONCHAINID_MANAGEMENT_PURPOSE = 1;
 
     struct InvestorIdentity {
         IIdentity identity;
@@ -43,10 +49,12 @@ contract ComplianceManager is AccessControl, IIdentityRegistry, ICompliance {
         _grantRole(COMPLIANCE_ADMIN_ROLE, admin);
     }
 
-    // ---------------------------------------------------------------------
-    // Legacy Bondary KYC helpers
-    // ---------------------------------------------------------------------
+    // ------- Legacy Bondary KYC helpers --------------------------------------
 
+    /// @notice Simplified mode: registers `account` with itself as IIdentity.
+    ///         No claim validation. Suitable for testnet / flat operator
+    ///         whitelists. Production deployments should use registerIdentity()
+    ///         with a real ONCHAINID contract.
     function whitelist(address account) external onlyRole(KYC_OPERATOR_ROLE) {
         _registerIdentity(account, IIdentity(account), 0);
         emit Whitelisted(account);
@@ -77,9 +85,7 @@ contract ComplianceManager is AccessControl, IIdentityRegistry, ICompliance {
         emit Unblacklisted(account);
     }
 
-    // ---------------------------------------------------------------------
-    // ERC-3643 Identity Registry
-    // ---------------------------------------------------------------------
+    // ------- ERC-3643 Identity Registry --------------------------------------
 
     function registerIdentity(address userAddress, IIdentity userIdentity, uint16 country)
         external
@@ -103,8 +109,9 @@ contract ComplianceManager is AccessControl, IIdentityRegistry, ICompliance {
         onlyRole(KYC_OPERATOR_ROLE)
     {
         require(address(userIdentity) != address(0), "Compliance: zero identity");
-        IIdentity oldIdentity = _identities[userAddress].identity;
         require(_identities[userAddress].registered, "Compliance: identity missing");
+        _validateIdentity(userAddress, userIdentity);
+        IIdentity oldIdentity = _identities[userAddress].identity;
         _identities[userAddress].identity = userIdentity;
         emit IdentityUpdated(oldIdentity, userIdentity);
     }
@@ -148,16 +155,12 @@ contract ComplianceManager is AccessControl, IIdentityRegistry, ICompliance {
         return _blacklisted[account];
     }
 
-    // ---------------------------------------------------------------------
-    // ERC-3643 Compliance
-    // ---------------------------------------------------------------------
+    // ------- ERC-3643 Compliance ---------------------------------------------
 
-    function bindToken(address token) external {
+    /// @notice S-05 : restricted to COMPLIANCE_ADMIN_ROLE. BondFactory receives
+    ///         this role in the deploy script and binds each new bond proxy.
+    function bindToken(address token) external onlyRole(COMPLIANCE_ADMIN_ROLE) {
         require(token != address(0), "Compliance: zero token");
-        require(
-            msg.sender == token || hasRole(COMPLIANCE_ADMIN_ROLE, msg.sender),
-            "Compliance: not authorized"
-        );
         if (!_boundTokens[token]) {
             _boundTokens[token] = true;
             emit TokenBound(token);
@@ -181,9 +184,7 @@ contract ComplianceManager is AccessControl, IIdentityRegistry, ICompliance {
     }
 
     function transferred(address, address, uint256) external view onlyBoundToken {}
-
     function created(address, uint256) external view onlyBoundToken {}
-
     function destroyed(address, uint256) external view onlyBoundToken {}
 
     modifier onlyBoundToken() {
@@ -194,6 +195,9 @@ contract ComplianceManager is AccessControl, IIdentityRegistry, ICompliance {
     function _registerIdentity(address userAddress, IIdentity userIdentity, uint16 country) internal {
         require(userAddress != address(0), "Compliance: zero user");
         require(address(userIdentity) != address(0), "Compliance: zero identity");
+
+        // S-06 : validate the IIdentity when it is a separate contract.
+        _validateIdentity(userAddress, userIdentity);
 
         IIdentity oldIdentity = _identities[userAddress].identity;
         bool wasRegistered = _identities[userAddress].registered;
@@ -217,5 +221,19 @@ contract ComplianceManager is AccessControl, IIdentityRegistry, ICompliance {
         require(investor.registered, "Compliance: identity missing");
         delete _identities[userAddress];
         emit IdentityRemoved(userAddress, investor.identity);
+    }
+
+    /// @dev S-06 : when identity != wallet, require the identity contract to
+    ///      declare a management key (purpose 1) for the wallet. Simplified
+    ///      mode (identity == wallet) is skipped because EOAs do not
+    ///      implement keyHasPurpose.
+    function _validateIdentity(address userAddress, IIdentity userIdentity) internal view {
+        if (address(userIdentity) == userAddress) return;
+        bytes32 walletKey = keccak256(abi.encode(userAddress));
+        try userIdentity.keyHasPurpose(walletKey, ONCHAINID_MANAGEMENT_PURPOSE) returns (bool ok) {
+            require(ok, "Compliance: identity missing management key");
+        } catch {
+            revert("Compliance: invalid identity contract");
+        }
     }
 }
