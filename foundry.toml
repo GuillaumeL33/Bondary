@@ -15,9 +15,11 @@ remappings = [
 ]
 
 [rpc_endpoints]
+sepolia  = "${SEPOLIA_RPC_URL}"
 polygon  = "${POLYGON_RPC_URL}"
 mainnet  = "${ETH_RPC_URL}"
 
 [etherscan]
+sepolia = { key = "${ETHERSCAN_API_KEY}", url = "https://api-sepolia.etherscan.io/api" }
 polygon = { key = "${POLYGONSCAN_API_KEY}" }
 mainnet = { key = "${ETHERSCAN_API_KEY}" }
