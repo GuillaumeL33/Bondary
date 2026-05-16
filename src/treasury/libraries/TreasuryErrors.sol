@@ -35,6 +35,7 @@ library TreasuryErrors {
     error VaultBelowMinimum(uint256 amount, uint256 minimum);
     error VaultRecipientNotEligible(address to);
     error VaultSenderNotEligible(address from);
+    error VaultOwnerMismatch(address caller, address owner);
 
     // ----- queues -----
     error OrderNotFound(uint256 orderId);
