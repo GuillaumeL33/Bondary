@@ -2,7 +2,6 @@
 pragma solidity 0.8.24;
 
 /// @title Custom errors shared by the Brivo Treasury stack.
-/// @dev Centralized for gas efficiency and consistent revert reasons in tests.
 library TreasuryErrors {
     // ----- generic -----
     error ZeroAddress();
@@ -51,9 +50,16 @@ library TreasuryErrors {
 
     // ----- fees / oracle / rescue -----
     error FeeTooHigh(uint16 fee, uint16 maxFee);
+    error FeeRecipientRequired();
+
     error OracleStale(uint256 updatedAt, uint256 maxAge);
     error OracleInvalidAnswer(int256 answer);
+    error OracleNotConfigured(address token);
+
     error RescueTimelockNotElapsed(uint64 readyAt, uint64 nowTs);
     error RescueProposalNotFound(bytes32 proposalId);
-    error RescueProposalAlreadyExists(bytes32 proposalId);
+    error RescueProposalAlreadyExecuted(bytes32 proposalId);
+    error RescueProposalCancelled(bytes32 proposalId);
+    error RescueInvalidKind();
+    error RescueUnsupportedKind(uint8 kind);
 }
